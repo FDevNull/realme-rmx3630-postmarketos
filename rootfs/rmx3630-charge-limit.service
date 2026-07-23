@@ -1,0 +1,12 @@
+[Unit]
+Description=RMX3630 80 percent charge limit
+After=rmx3630-battery.service
+Requires=rmx3630-battery.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe rmx3630_charge_limit
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

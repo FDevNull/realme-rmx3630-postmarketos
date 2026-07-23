@@ -20,11 +20,13 @@ postmarketOS и не готовая потребительская прошив�
 - встроенный динамик;
 - Wi-Fi и NetworkManager;
 - экранная клавиатура Squeekboard;
-- USB-сеть RNDIS, SSH и отладочная shell.
+- USB-сеть RNDIS, SSH и отладочная shell;
+- расчётный процент аккумулятора в UPower/Phosh;
+- ограничение заряда до 80% с возобновлением при 75%.
 
 Не работают или не проверены полностью:
 
-- процент заряда и состояние зарядки;
+- точный coulomb-counter и полное определение состояния зарядки;
 - нормальный suspend/resume и стандартный DRM DPMS;
 - микрофоны и гарнитура;
 - камеры;
@@ -289,7 +291,8 @@ telnet 172.16.42.1 23
 ```sh
 systemctl --failed
 systemctl is-active \
-  rmx3630-audio rmx3630-gpu rmx3630-input rmx3630-softpower \
+  rmx3630-audio rmx3630-battery rmx3630-charge-limit \
+  rmx3630-gpu rmx3630-input rmx3630-softpower \
   rmx3630-pulse-sink rmx3630-phosh-direct rmx3630-wifi \
   NetworkManager sshd
 
@@ -382,10 +385,31 @@ cat /run/rmx3630-phosh.log
 `/dev/dri/renderD128`. Не запускайте обычный DPMS-off вручную: панель может не
 включиться до перезагрузки.
 
-### Не отображается аккумулятор
+### Аккумулятор и ограничение 80%
 
-Это известное ограничение. Не пытайтесь исправить его загрузкой
-`oplus_chg.ko`: текущая версия вызывает падение ядра.
+Локальный `rmx3630_battery` читает напряжение через MT6358 AUXADC и
+регистрирует стандартный Linux `power_supply`. UPower и Phosh отображают
+расчётный процент:
+
+```sh
+cat /sys/class/power_supply/battery/uevent
+upower -i /org/freedesktop/UPower/devices/battery_battery
+systemctl status rmx3630-battery --no-pager
+```
+
+Это оценка по напряжению, а не штатный coulomb-counter, поэтому под нагрузкой
+возможны колебания на несколько процентов.
+
+Модуль `rmx3630_charge_limit` управляет только битом `CHG_CONFIG` зарядника
+TI BQ25890H: отключает заряд при 80% и включает снова при 75%. Проверка:
+
+```sh
+systemctl status rmx3630-charge-limit --no-pager
+journalctl -b -k | grep rmx3630-charge-limit
+```
+
+Не загружайте `oplus_chg.ko`: он по-прежнему вызывает падение ядра в этом
+Linux-окружении.
 
 ## Возврат на Android
 
