@@ -1,0 +1,14 @@
+[Unit]
+Description=RMX3630 MediaTek SensorHub
+After=local-fs.target systemd-udevd.service rmx3630-audio.service
+Requires=rmx3630-audio.service
+Before=rmx3630-sensor-proxy.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rmx3630-load-sensors
+RemainAfterExit=yes
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target

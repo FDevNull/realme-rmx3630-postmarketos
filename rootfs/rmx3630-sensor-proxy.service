@@ -1,0 +1,17 @@
+[Unit]
+Description=RMX3630 accelerometer SensorProxy
+After=dbus.service rmx3630-sensorhub.service
+Requires=dbus.service rmx3630-sensorhub.service
+Before=rmx3630-phosh-direct.service graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rmx3630-sensor-proxy
+Restart=on-failure
+RestartSec=2
+User=root
+Group=root
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -81,10 +81,21 @@ def choose_restore_brightness() -> int:
 
 
 def run() -> None:
-    soft_off = False
+    try:
+        soft_off = int(read_text(BACKLIGHT)) == 0
+    except (OSError, ValueError):
+        soft_off = False
+
     touch_fd = None
     last_toggle = 0.0
     restore_brightness = choose_restore_brightness()
+
+    # A previous process may have exited while the display was blanked.
+    # Restore a usable state instead of inheriting stale in-memory state.
+    if soft_off:
+        write_text(BACKLIGHT, restore_brightness)
+        soft_off = False
+        log(f"display recovered at startup, brightness={restore_brightness}")
 
     while True:
         event_path = find_input_event("mtk-pmic-keys")

@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+EXPECTED_KERNEL="5.10.209-android12-9-o-05206-g23c1467af8f7"
+MODULE_DIR="/usr/lib/modules/$EXPECTED_KERNEL/extra/rmx3630-sensors"
+
+fail() {
+    echo "rmx3630-load-sensors: $*" >&2
+    exit 1
+}
+
+[ "$(uname -r)" = "$EXPECTED_KERNEL" ] ||
+    fail "unexpected kernel: $(uname -r)"
+
+for module in mtk_mbox mtk_rpmsg_mbox mtk_tinysys_ipi scp; do
+    [ -d "/sys/module/$module" ] ||
+        fail "required SCP module $module is not loaded"
+done
+
+if [ ! -d /sys/module/hf_manager ]; then
+    insmod "$MODULE_DIR/hf_manager.ko"
+fi
+
+if [ ! -d /sys/module/sensorhub ]; then
+    insmod "$MODULE_DIR/sensorhub.ko"
+fi
+
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+    if [ -r /sys/class/hf_manager/hf_manager/dev ]; then
+        break
+    fi
+
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+
+[ -r /sys/class/hf_manager/hf_manager/dev ] ||
+    fail "hf_manager device was not registered"
+
+device_number="$(cat /sys/class/hf_manager/hf_manager/dev)"
+major="${device_number%:*}"
+minor="${device_number#*:}"
+
+case "$major:$minor" in
+    *[!0-9:]*|"")
+        fail "invalid hf_manager device number: $device_number"
+        ;;
+esac
+
+if [ ! -e /dev/hf_manager ]; then
+    mknod /dev/hf_manager c "$major" "$minor"
+fi
+
+actual_device="$(
+    stat -c '%t:%T' /dev/hf_manager 2>/dev/null || true
+)"
+
+[ -c /dev/hf_manager ] ||
+    fail "/dev/hf_manager is not a character device"
+
+chown root:input /dev/hf_manager
+chmod 0660 /dev/hf_manager
+
+grep -q "mc34x9_acc" /proc/hf_manager ||
+    fail "mc34x9_acc was not detected"
+
+echo "RMX3630 SensorHub is ready"

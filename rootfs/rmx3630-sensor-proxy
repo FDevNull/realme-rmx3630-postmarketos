@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+
+import asyncio
+import errno
+import fcntl
+import logging
+import os
+import signal
+import struct
+from collections import deque
+from pathlib import Path
+from typing import Final
+
+from dbus_next import BusType, Variant
+from dbus_next.aio import MessageBus
+from dbus_next.constants import PropertyAccess
+from dbus_next.service import ServiceInterface, dbus_property, method
+
+
+DEVICE: Final = Path("/dev/hf_manager")
+BUS_NAME: Final = "net.hadess.SensorProxy"
+OBJECT_PATH: Final = "/net/hadess/SensorProxy"
+
+SENSOR_TYPE_ACCELEROMETER: Final = 1
+HF_MANAGER_SENSOR_DISABLE: Final = 0
+HF_MANAGER_SENSOR_ENABLE: Final = 1
+DATA_ACTION: Final = 0
+
+COMMAND_SIZE: Final = 52
+EVENT_SIZE: Final = 76
+IOCTL_PACKET_SIZE: Final = 68
+
+SAMPLE_INTERVAL_NS: Final = 100_000_000
+SWITCH_THRESHOLD: Final = 6.5
+DOMINANCE_MARGIN: Final = 2.0
+STABLE_SAMPLES: Final = 5
+
+# Linux _IOC encoding for aarch64.
+IOC_NRBITS: Final = 8
+IOC_TYPEBITS: Final = 8
+IOC_SIZEBITS: Final = 14
+
+IOC_NRSHIFT: Final = 0
+IOC_TYPESHIFT: Final = IOC_NRSHIFT + IOC_NRBITS
+IOC_SIZESHIFT: Final = IOC_TYPESHIFT + IOC_TYPEBITS
+IOC_DIRSHIFT: Final = IOC_SIZESHIFT + IOC_SIZEBITS
+
+IOC_WRITE: Final = 1
+IOC_READ: Final = 2
+
+
+def ioc(direction: int, kind: int, number: int, size: int) -> int:
+    return (
+        (direction << IOC_DIRSHIFT)
+        | (kind << IOC_TYPESHIFT)
+        | (number << IOC_NRSHIFT)
+        | (size << IOC_SIZESHIFT)
+    )
+
+
+HF_MANAGER_REQUEST_REGISTER_STATUS: Final = ioc(
+    IOC_READ | IOC_WRITE, ord("a"), 1, IOCTL_PACKET_SIZE
+)
+
+HF_MANAGER_REQUEST_SENSOR_INFO: Final = ioc(
+    IOC_READ | IOC_WRITE, ord("a"), 6, IOCTL_PACKET_SIZE
+)
+
+HF_MANAGER_REQUEST_READY_STATUS: Final = ioc(
+    IOC_READ | IOC_WRITE, ord("a"), 8, IOCTL_PACKET_SIZE
+)
+
+
+class SensorProxyInterface(ServiceInterface):
+    def __init__(self) -> None:
+        super().__init__("net.hadess.SensorProxy")
+        self._orientation = "undefined"
+        self._claimed = 0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def HasAccelerometer(self) -> "b":
+        return True
+
+    @dbus_property(access=PropertyAccess.READ)
+    def AccelerometerOrientation(self) -> "s":
+        return self._orientation
+
+    @dbus_property(access=PropertyAccess.READ)
+    def HasAmbientLight(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def LightLevel(self) -> "d":
+        return 0.0
+
+    @dbus_property(access=PropertyAccess.READ)
+    def LightLevelUnit(self) -> "s":
+        return "lux"
+
+    @dbus_property(access=PropertyAccess.READ)
+    def HasProximity(self) -> "b":
+        return False
+
+    @dbus_property(access=PropertyAccess.READ)
+    def ProximityNear(self) -> "b":
+        return False
+
+    @method()
+    def ClaimAccelerometer(self) -> "":
+        self._claimed += 1
+
+    @method()
+    def ReleaseAccelerometer(self) -> "":
+        self._claimed = max(0, self._claimed - 1)
+
+    @method()
+    def ClaimLight(self) -> "":
+        return
+
+    @method()
+    def ReleaseLight(self) -> "":
+        return
+
+    @method()
+    def ClaimProximity(self) -> "":
+        return
+
+    @method()
+    def ReleaseProximity(self) -> "":
+        return
+
+    def set_orientation(self, orientation: str) -> None:
+        if orientation == self._orientation:
+            return
+
+        old = self._orientation
+        self._orientation = orientation
+
+        self.emit_properties_changed(
+            {
+                "AccelerometerOrientation": orientation,
+            }
+        )
+
+        logging.info("orientation: %s -> %s", old, orientation)
+
+
+class HFManager:
+    def __init__(self) -> None:
+        self.fd = -1
+        self.buffer = bytearray()
+
+    @staticmethod
+    def _ioctl_packet(sensor_type: int) -> bytearray:
+        packet = bytearray(IOCTL_PACKET_SIZE)
+        packet[0] = sensor_type
+        return packet
+
+    def open(self) -> None:
+        self.fd = os.open(
+            DEVICE,
+            os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+
+        ready = self._ioctl_packet(SENSOR_TYPE_ACCELEROMETER)
+        fcntl.ioctl(
+            self.fd,
+            HF_MANAGER_REQUEST_READY_STATUS,
+            ready,
+            True,
+        )
+
+        if not ready[4]:
+            raise RuntimeError("SensorHub reports that devices are not ready")
+
+        registered = self._ioctl_packet(SENSOR_TYPE_ACCELEROMETER)
+        fcntl.ioctl(
+            self.fd,
+            HF_MANAGER_REQUEST_REGISTER_STATUS,
+            registered,
+            True,
+        )
+
+        if not registered[4]:
+            raise RuntimeError("accelerometer sensor type 1 is not registered")
+
+        info = self._ioctl_packet(SENSOR_TYPE_ACCELEROMETER)
+        fcntl.ioctl(
+            self.fd,
+            HF_MANAGER_REQUEST_SENSOR_INFO,
+            info,
+            True,
+        )
+
+        sensor_type, gain = struct.unpack_from("<B3xI", info, 4)
+        name = bytes(info[12:28]).split(b"\0", 1)[0].decode(
+            errors="replace"
+        )
+        vendor = bytes(info[28:44]).split(b"\0", 1)[0].decode(
+            errors="replace"
+        )
+
+        logging.info(
+            "accelerometer: type=%d name=%s vendor=%s gain=%d",
+            sensor_type,
+            name,
+            vendor,
+            gain,
+        )
+
+        if sensor_type != SENSOR_TYPE_ACCELEROMETER:
+            raise RuntimeError(
+                f"unexpected accelerometer type returned: {sensor_type}"
+            )
+
+        if name != "mc34x9_acc":
+            raise RuntimeError(
+                f"unexpected accelerometer model returned: {name}"
+            )
+
+    def command(
+        self,
+        action: int,
+        delay_ns: int = 0,
+        latency_ns: int = 0,
+    ) -> None:
+        command = bytearray(COMMAND_SIZE)
+        command[0] = SENSOR_TYPE_ACCELEROMETER
+        command[1] = action & 0x0F
+
+        if action == HF_MANAGER_SENSOR_ENABLE:
+            batch = struct.pack("<qq", delay_ns, latency_ns)
+            command[2] = len(batch)
+            command[4 : 4 + len(batch)] = batch
+
+        result = os.write(self.fd, command)
+
+        # This driver returns zero on success instead of bytes consumed.
+        if result not in (0, COMMAND_SIZE):
+            raise RuntimeError(
+                f"unexpected hf_manager write result: {result}"
+            )
+
+    def enable(self) -> None:
+        self.command(
+            HF_MANAGER_SENSOR_ENABLE,
+            SAMPLE_INTERVAL_NS,
+            0,
+        )
+
+    def disable(self) -> None:
+        if self.fd < 0:
+            return
+
+        try:
+            self.command(HF_MANAGER_SENSOR_DISABLE)
+        except OSError as error:
+            logging.warning(
+                "failed to disable accelerometer: %s",
+                error,
+            )
+
+    def close(self) -> None:
+        self.disable()
+
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def read_events(self) -> list[tuple[float, float, float]]:
+        events: list[tuple[float, float, float]] = []
+
+        while True:
+            try:
+                chunk = os.read(self.fd, EVENT_SIZE * 32)
+            except BlockingIOError:
+                break
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EINTR):
+                    break
+                raise
+
+            if not chunk:
+                break
+
+            self.buffer.extend(chunk)
+
+        while len(self.buffer) >= EVENT_SIZE:
+            event = bytes(self.buffer[:EVENT_SIZE])
+            del self.buffer[:EVENT_SIZE]
+
+            (
+                _timestamp,
+                sensor_type,
+                _accuracy,
+                action,
+                    _padding,
+                x_raw,
+                y_raw,
+                z_raw,
+            ) = struct.unpack_from("<qBBBBiii", event, 0)
+
+            if sensor_type != SENSOR_TYPE_ACCELEROMETER:
+                continue
+
+            if action != DATA_ACTION:
+                continue
+
+            events.append(
+                (
+                    x_raw / 1000.0,
+                    y_raw / 1000.0,
+                    z_raw / 1000.0,
+                )
+            )
+
+        return events
+
+
+class OrientationDetector:
+    def __init__(self) -> None:
+        self.candidates: deque[str] = deque(maxlen=STABLE_SAMPLES)
+        self.current = "undefined"
+
+    @staticmethod
+    def classify(x: float, y: float, z: float) -> str | None:
+        abs_x = abs(x)
+        abs_y = abs(y)
+
+        if max(abs_x, abs_y) < SWITCH_THRESHOLD:
+            return None
+
+        if abs(abs_x - abs_y) < DOMINANCE_MARGIN:
+            return None
+
+        if abs_y > abs_x:
+            return "normal" if y > 0 else "bottom-up"
+
+        return "right-up" if x > 0 else "left-up"
+
+    def update(self, x: float, y: float, z: float) -> str | None:
+        candidate = self.classify(x, y, z)
+
+        if candidate is None:
+            self.candidates.clear()
+            return None
+
+        self.candidates.append(candidate)
+
+        if len(self.candidates) < STABLE_SAMPLES:
+            return None
+
+        if any(value != candidate for value in self.candidates):
+            return None
+
+        if candidate == self.current:
+            return None
+
+        self.current = candidate
+        return candidate
+
+
+async def run() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    manager = HFManager()
+    manager.open()
+    manager.enable()
+
+    detector = OrientationDetector()
+    interface = SensorProxyInterface()
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    bus.export(OBJECT_PATH, interface)
+
+    request_result = await bus.request_name(BUS_NAME)
+    logging.info("D-Bus name request result: %s", request_result)
+
+    loop = asyncio.get_running_loop()
+    stopped = asyncio.Event()
+
+
+    def stop() -> None:
+        stopped.set()
+
+    def process_events() -> None:
+        try:
+            for x, y, z in manager.read_events():
+                orientation = detector.update(x, y, z)
+
+                if orientation is not None:
+                    interface.set_orientation(orientation)
+        except Exception:
+            logging.exception("failed to read accelerometer")
+            stopped.set()
+
+    loop.add_reader(manager.fd, process_events)
+
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signal_number, stop)
+
+    logging.info(
+        "RMX3630 SensorProxy ready on %s%s",
+        BUS_NAME,
+        OBJECT_PATH,
+    )
+
+    try:
+        await stopped.wait()
+    finally:
+        loop.remove_reader(manager.fd)
+        manager.close()
+        bus.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

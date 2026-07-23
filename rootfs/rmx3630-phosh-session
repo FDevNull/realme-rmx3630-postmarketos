@@ -1,38 +1,75 @@
 #!/bin/sh
 # Start the bare Phosh shell together with the services normally supplied by
-# phosh-session/gnome-session.  The RMX3630 port cannot use a VT-backed display
+# phosh-session/gnome-session. The RMX3630 port cannot use a VT-backed display
 # manager yet, so these session helpers must share phoc's Wayland and D-Bus
 # environment directly.
+
+set -u
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 phosh_pid=
 osk_pid=
 nm_pid=
+media_keys_pid=
 
 stop_helpers() {
-	[ -z "$osk_pid" ] || kill "$osk_pid" 2>/dev/null || true
-	[ -z "$nm_pid" ] || kill "$nm_pid" 2>/dev/null || true
+    [ -z "$media_keys_pid" ] ||
+        kill "$media_keys_pid" 2>/dev/null || true
+    [ -z "$osk_pid" ] ||
+        kill "$osk_pid" 2>/dev/null || true
+    [ -z "$nm_pid" ] ||
+        kill "$nm_pid" 2>/dev/null || true
 }
+
 trap stop_helpers EXIT HUP INT TERM
 
 /usr/libexec/phosh &
 phosh_pid=$!
 
-# phoc has created WAYLAND_DISPLAY before executing this script.  A short
-# delay lets Phosh claim its shell protocols before the input method connects.
+# phoc has created WAYLAND_DISPLAY before executing this script. A short delay
+# lets Phosh claim its shell protocols before the session helpers connect.
 sleep 1
 
 if command -v squeekboard >/dev/null 2>&1; then
-	squeekboard >"$runtime_dir/squeekboard.log" 2>&1 &
-	osk_pid=$!
+    squeekboard >"$runtime_dir/squeekboard.log" 2>&1 &
+    osk_pid=$!
 fi
 
-# Phosh can ask NetworkManager to activate an AP, but a SecretAgent is needed
-# for the WPA password dialog.  nm-applet supplies that agent; its tray icon is
-# harmless when the shell does not expose a traditional notification area.
 if command -v nm-applet >/dev/null 2>&1; then
-	nm-applet --indicator >"$runtime_dir/nm-applet.log" 2>&1 &
-	nm_pid=$!
+    nm-applet --indicator >"$runtime_dir/nm-applet.log" 2>&1 &
+    nm_pid=$!
+fi
+
+# Handle KEY_VOLUMEUP, KEY_VOLUMEDOWN and other multimedia keys. This process
+# must run inside the same D-Bus and Wayland session as Phosh.
+if [ -x /usr/libexec/gsd-media-keys ]; then
+    # gsd-media-keys sends volume OSD updates through
+    # org.gnome.Shell.ShowOSD. Wait until Phosh owns that D-Bus name.
+    shell_ready=0
+    attempt=0
+
+    while [ "$attempt" -lt 50 ]; do
+        if gdbus introspect \
+            --session \
+            --dest org.gnome.Shell \
+            --object-path /org/gnome/Shell \
+            >/dev/null 2>&1; then
+            shell_ready=1
+            break
+        fi
+
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+
+    if [ "$shell_ready" -eq 1 ]; then
+        /usr/libexec/gsd-media-keys \
+            >"$runtime_dir/gsd-media-keys.log" 2>&1 &
+        media_keys_pid=$!
+    else
+        echo "org.gnome.Shell did not appear on session D-Bus" \
+            >"$runtime_dir/gsd-media-keys.log"
+    fi
 fi
 
 wait "$phosh_pid"
