@@ -1,0 +1,14 @@
+[Unit]
+Description=RMX3630 safe AUXADC battery indicator
+After=systemd-modules-load.service rmx3630-audio.service
+Wants=rmx3630-audio.service
+Before=upower.service rmx3630-phosh-direct.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe rmx3630_battery
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+

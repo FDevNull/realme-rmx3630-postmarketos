@@ -47,7 +47,11 @@ Working and physically verified:
 - internal speaker through MT6789 AFE, MT6358 and SIA8100x;
 - automatic ALSA/UCM/PulseAudio speaker setup after a cold boot;
 - MT6789 Wi-Fi through the downstream WMT/WLAN modules and NetworkManager;
-- Squeekboard and NetworkManager's password agent in the direct Phosh session.
+- Squeekboard and NetworkManager's password agent in the direct Phosh session;
+- battery voltage and estimated percentage through a safe AUXADC power-supply
+  driver, without the Android/Oplus charging stack;
+- an 80% charge limit for the detected TI BQ25890H charger (charging resumes
+  at 75%).
 
 The full-root wrapper deliberately skips its old five-second `modetest`
 preview.  Stopping that preview makes the stock AMOLED driver power-cycle the
@@ -67,7 +71,7 @@ from 1 to 2047 in
 
 Not working, incomplete, or not yet tested end-to-end:
 
-- battery percentage/charging state in UPower;
+- accurate coulomb-counter capacity and complete charging-state reporting;
 - true suspend/resume and normal DRM DPMS;
 - microphones, headset routing, cameras, modem calls/mobile data, Bluetooth,
   GPS, NFC, flashlight and most sensors.
@@ -106,6 +110,19 @@ bash /mnt/c/Users/Valtos/Documents/Random/rmx3630-linux-port/scripts/build-alpin
 ```
 
 The output is `out/rmx3630-alpine-test-boot.img`.
+
+Build the battery indicator and 80% charge limiter against the prepared
+stock-ABI kernel output:
+
+```sh
+bash /mnt/c/Users/Valtos/Documents/Random/rmx3630-linux-port/scripts/build-battery-module.sh
+```
+
+This produces `out/rmx3630_battery.live.ko` and
+`out/rmx3630_charge_limit.live.ko`. The percentage is currently estimated
+from battery voltage, so it may move by several points as load changes. The
+limiter polls every 30 seconds, disables BQ25890H `REG03[4]` at 80%, and
+reenables it at 75%.
 
 The persistent postmarketOS/Phosh root used on the first device was built with
 pmbootstrap 3.11.1 from the v26.06 pmaports branch, with `systemd=always` and
@@ -153,5 +170,5 @@ data and are not needed for this port.
 
 Never load the stock `oplus_chg.ko` in this userspace. It dereferences missing
 Android/Oplus services and caused a reproducible kernel NULL dereference. The
-battery driver currently depends on it, so battery reporting remains disabled
-until that dependency is removed or replaced.
+local battery and charge-limit modules replace only the small subset needed
+for UPower reporting and the BQ25890H charge-enable switch.

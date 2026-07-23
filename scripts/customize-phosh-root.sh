@@ -64,6 +64,10 @@ sudo install -Dm0755 "$project_dir/rootfs/rmx3630-start-pulse-sink" \
 	"$mount_dir/usr/local/sbin/rmx3630-start-pulse-sink"
 sudo install -Dm0644 "$project_dir/rootfs/rmx3630-audio.service" \
 	"$mount_dir/etc/systemd/system/rmx3630-audio.service"
+sudo install -Dm0644 "$project_dir/rootfs/rmx3630-battery.service" \
+	"$mount_dir/etc/systemd/system/rmx3630-battery.service"
+sudo install -Dm0644 "$project_dir/rootfs/rmx3630-charge-limit.service" \
+	"$mount_dir/etc/systemd/system/rmx3630-charge-limit.service"
 sudo install -Dm0755 "$project_dir/rootfs/rmx3630-load-gpu" \
 	"$mount_dir/usr/local/sbin/rmx3630-load-gpu"
 sudo install -Dm0644 "$project_dir/rootfs/rmx3630-gpu.service" \
@@ -104,6 +108,14 @@ sudo mkdir -p "$audio_module_dir"
 for module in "$project_dir/out/audio-live-dvfs-disabled/"*.ko; do
 	sudo install -m0644 "$module" "$audio_module_dir/${module##*/}"
 done
+battery_module_dir="$mount_dir/usr/lib/modules/5.10.209-android12-9-o-05206-g23c1467af8f7/extra/rmx3630-battery"
+sudo install -Dm0644 \
+	"$project_dir/out/rmx3630_battery.live.ko" \
+	"$battery_module_dir/rmx3630_battery.ko"
+charge_limit_module_dir="$mount_dir/usr/lib/modules/5.10.209-android12-9-o-05206-g23c1467af8f7/extra/rmx3630-charge-limit"
+sudo install -Dm0644 \
+	"$project_dir/out/rmx3630_charge_limit.live.ko" \
+	"$charge_limit_module_dir/rmx3630_charge_limit.ko"
 input_module_dir="$mount_dir/usr/lib/modules/5.10.209-android12-9-o-05206-g23c1467af8f7/extra/rmx3630-input"
 sudo install -Dm0644 "$project_dir/out/mtk-kpd.ko" \
 	"$input_module_dir/mtk-kpd.ko"
@@ -134,6 +146,10 @@ sudo ln -sfn ../rmx3630-phosh-direct.service \
 sudo mkdir -p "$mount_dir/etc/systemd/system/multi-user.target.wants"
 sudo ln -sfn ../rmx3630-audio.service \
 	"$mount_dir/etc/systemd/system/multi-user.target.wants/rmx3630-audio.service"
+sudo ln -sfn ../rmx3630-battery.service \
+	"$mount_dir/etc/systemd/system/multi-user.target.wants/rmx3630-battery.service"
+sudo ln -sfn ../rmx3630-charge-limit.service \
+	"$mount_dir/etc/systemd/system/multi-user.target.wants/rmx3630-charge-limit.service"
 sudo ln -sfn ../rmx3630-gpu.service \
 	"$mount_dir/etc/systemd/system/multi-user.target.wants/rmx3630-gpu.service"
 sudo ln -sfn ../rmx3630-wifi.service \

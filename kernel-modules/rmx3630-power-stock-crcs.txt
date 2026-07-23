@@ -1,0 +1,16 @@
+# Exported-symbol CRCs from the tested RMX3630 stock kernel.
+module_layout 0x7c24b32d
+power_supply_get_drvdata 0xbbfcc83e
+power_supply_changed 0x886d3ed1
+power_supply_register 0x62e6d81c
+power_supply_get_property 0xbb72d6b4
+power_supply_get_by_name 0x0175ced1
+i2c_smbus_read_byte_data 0xae87eb36
+i2c_smbus_write_byte_data 0x610b7c49
+of_find_node_by_name 0x87f6e3eb
+of_find_device_by_node 0x68bc512b
+of_find_i2c_device_by_node 0x1a31f223
+_dev_err 0x5ed4c6ae
+_dev_info 0x8eff6041
+_dev_warn 0xbc7a4422
+devm_kmalloc 0x08e2fd0c
