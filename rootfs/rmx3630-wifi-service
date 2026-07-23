@@ -1,0 +1,106 @@
+#!/bin/sh
+set -eu
+
+log=/run/rmx3630-wmt-launcher.log
+launcher_pid=
+
+make_node() {
+	class="$1"
+	name="$2"
+	path="$3"
+	mode="$4"
+
+	count=0
+	while [ ! -r "/sys/class/$class/$name/dev" ] && [ "$count" -lt 20 ]; do
+		sleep 0.25
+		count=$((count + 1))
+	done
+	[ -r "/sys/class/$class/$name/dev" ]
+
+	devnum="$(cat "/sys/class/$class/$name/dev")"
+	major="${devnum%:*}"
+	minor="${devnum#*:}"
+	if [ ! -e "$path" ]; then
+		mknod "$path" c "$major" "$minor"
+	fi
+	chown root:root "$path"
+	chmod "$mode" "$path"
+}
+
+stop_launcher() {
+	if [ -n "$launcher_pid" ]; then
+		kill "$launcher_pid" 2>/dev/null || true
+		wait "$launcher_pid" 2>/dev/null || true
+	fi
+}
+trap stop_launcher EXIT HUP INT TERM
+
+echo "rmx3630-wifi: loading MT6789 connectivity core"
+modprobe cfg80211
+modprobe connadp
+modprobe btif_drv
+modprobe connfem
+modprobe wmt_drv
+
+make_node wmtdetect wmtdetect /dev/wmtdetect 0600
+
+# The detect ioctl creates the actual WMT/STP core. Skip it when adopting a
+# stack that was brought up manually during development.
+if [ ! -r /sys/class/stpwmt/stpwmt/dev ]; then
+	/usr/local/sbin/rmx3630-wmtdetect-init
+fi
+
+make_node stpwmt stpwmt /dev/stpwmt 0600
+if [ -r /sys/class/fw_log_wmt/fw_log_wmt/dev ]; then
+	make_node fw_log_wmt fw_log_wmt /dev/fw_log_wmt 0600
+fi
+
+rm -f "$log"
+/usr/local/sbin/rmx3630-wmt-launcher >"$log" 2>&1 &
+launcher_pid=$!
+
+count=0
+while ! grep -q 'WMT LPBK power-on succeeded' "$log" 2>/dev/null; do
+	if ! kill -0 "$launcher_pid" 2>/dev/null; then
+		cat "$log" >&2 || true
+		exit 1
+	fi
+	if [ "$count" -ge 80 ]; then
+		echo "rmx3630-wifi: WMT launcher timed out" >&2
+		cat "$log" >&2 || true
+		exit 1
+	fi
+	sleep 0.25
+	count=$((count + 1))
+done
+
+echo "rmx3630-wifi: loading WLAN driver"
+modprobe wmt_chrdev_wifi
+modprobe oplus_wificapcenter
+modprobe mddp
+make_node wmtWifi wmtWifi /dev/wmtWifi 0660
+modprobe wlan_drv_gen4m_6789
+
+# The vendor WLAN module only registers the bus driver. This write powers the
+# radio and creates wlan0/wlan1/p2p0/ap0. Avoid writing it again when adopting
+# an already-powered live stack.
+if [ ! -d /sys/class/net/wlan0 ]; then
+	printf '1\n' > /dev/wmtWifi
+fi
+
+count=0
+while [ ! -d /sys/class/net/wlan0 ] && [ "$count" -lt 80 ]; do
+	if ! kill -0 "$launcher_pid" 2>/dev/null; then
+		cat "$log" >&2 || true
+		exit 1
+	fi
+	sleep 0.25
+	count=$((count + 1))
+done
+[ -d /sys/class/net/wlan0 ]
+
+echo "rmx3630-wifi: wlan0 ready"
+systemd-notify --ready --status='RMX3630 Wi-Fi ready'
+
+wait "$launcher_pid"
+launcher_pid=

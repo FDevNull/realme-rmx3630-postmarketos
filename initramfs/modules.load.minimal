@@ -1,0 +1,21 @@
+# Exact stock RMX3630 modules, dependency-first, only through the USB device controller.
+mrdump.ko
+aee_aed.ko
+nvmem_mtk-devinfo.ko
+oplusboot.ko
+buildvariant.ko
+oplus_project.ko
+pinctrl-mtk-v2.ko
+pinctrl-mt6789.ko
+clk-common.ko
+clk-mt6789.ko
+clk-mt6789-bus.ko
+mtk-scpsys.ko
+mtk-scpsys-mt6789.ko
+mtk-dvfsrc.ko
+oplus_bootargs.ko
+phy-generic.ko
+phy-mtk-tphy.ko
+musb_hdrc.ko
+musb_boost.ko
+musb_main.ko

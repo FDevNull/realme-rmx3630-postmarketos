@@ -1,0 +1,11 @@
+// The RMX3630 port starts Phosh directly under phoc because the stock kernel
+// cannot provide a normal VT-backed display-manager session.  Consequently
+// logind does not mark the desktop user as locally active and NetworkManager's
+// default polkit policy rejects Wi-Fi operations.  This device has one local
+// desktop account, so grant that account NetworkManager control explicitly.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "user" &&
+        action.id.indexOf("org.freedesktop.NetworkManager.") == 0) {
+        return polkit.Result.YES;
+    }
+});

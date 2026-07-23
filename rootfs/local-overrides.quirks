@@ -1,0 +1,14 @@
+# The downstream Oplus FT3518 driver advertises ABS_MT_WIDTH_MAJOR with an
+# invalid zero-sized range.  libinput rejects the whole touchscreen unless
+# this unused Android-only axis is ignored.
+[Realme 10 FT3518 touchscreen]
+MatchName=touchpanel
+AttrEventCode=-ABS_MT_WIDTH_MAJOR;-ABS_MT_PRESSURE
+
+# Phosh turns the DRM connector fully off for KEY_POWER.  The downstream
+# Samsung AMOLED driver cannot reliably resume from that state outside the
+# Android display stack, so a small helper below handles only this key with a
+# DSI-brightness soft blank.  Keep KEY_VOLUMEUP exposed to libinput.
+[Realme 10 PMIC power key]
+MatchName=mtk-pmic-keys
+AttrEventCode=-KEY_POWER

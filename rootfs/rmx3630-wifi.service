@@ -1,0 +1,17 @@
+[Unit]
+Description=RMX3630 MT6789 WMT and Wi-Fi stack
+After=local-fs.target systemd-modules-load.service rmx3630-audio.service
+Wants=rmx3630-audio.service
+Before=NetworkManager.service rmx3630-phosh-direct.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/local/sbin/rmx3630-wifi-service
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=60
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,143 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+mkdir -p /run /tmp /sys/kernel/config
+exec >>/run/rmx3630-systemd-wrapper.log 2>&1
+echo "rmx3630: full-root wrapper entered" >/dev/kmsg 2>/dev/null || true
+
+# The initramfs uses a plain tmpfs for /dev.  Keep this defensive repair even
+# after fixing stage 1 so older boot images cannot leave a regular file here.
+if [ ! -c /dev/null ]; then
+	rm -f /dev/null
+	mknod -m 0666 /dev/null c 1 3
+fi
+chown root:root /dev/null
+chmod 0666 /dev/null
+mkdir -p /run/user/10000
+chown user:user /run/user/10000
+chmod 0700 /run/user/10000
+
+pmsg_line() {
+	[ -c /dev/pmsg0 ] || return 0
+	printf '\nRMX3630_FULL: %s\n' "$*" >/dev/pmsg0 2>/dev/null || true
+}
+
+pmsg_line WRAPPER_STARTED
+
+# The stock MediaTek driver has no writable standard usb_role attribute, but
+# its own cmode value 3 is MUSB_DR_OPERATION_DEVICE.
+cmode=/sys/devices/platform/soc/mt_usb/musb-hdrc/cmode
+if [ -w "$cmode" ] && printf 3 >"$cmode"; then
+	pmsg_line "USB_CMODE value=$(cat "$cmode" 2>/dev/null)"
+else
+	pmsg_line USB_CMODE_FAILED
+fi
+
+udc=
+waited=0
+while [ "$waited" -lt 45 ]; do
+	for candidate in /sys/class/udc/*; do
+		[ -e "$candidate" ] || continue
+		name="${candidate##*/}"
+		case "$name" in dummy*) continue ;; esac
+		udc="$name"
+		break
+	done
+	[ -n "$udc" ] && break
+	sleep 1
+	waited=$((waited + 1))
+done
+
+if [ -n "$udc" ]; then
+	mount -t configfs none /sys/kernel/config 2>/dev/null || true
+	g=/sys/kernel/config/usb_gadget/rmx3630
+	mkdir -p "$g"
+	cd "$g" || exit 1
+
+	printf 0x0525 >idVendor
+	printf 0xa4a2 >idProduct
+	printf 0x0200 >bcdUSB
+	printf 0x0100 >bcdDevice
+	printf 0xEF >bDeviceClass
+	printf 0x02 >bDeviceSubClass
+	printf 0x01 >bDeviceProtocol
+
+	mkdir -p strings/0x409 configs/c.1/strings/0x409
+	printf RMX3630PMOS >strings/0x409/serialnumber
+	printf postmarketOS >strings/0x409/manufacturer
+	printf 'RMX3630 Phosh debug' >strings/0x409/product
+	printf 'RNDIS debug link' >configs/c.1/strings/0x409/configuration
+	printf 250 >configs/c.1/MaxPower
+
+	mkdir -p functions/rndis.usb0
+	ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
+	printf 1 >os_desc/use 2>/dev/null || true
+	printf 0xcd >os_desc/b_vendor_code 2>/dev/null || true
+	printf MSFT100 >os_desc/qw_sign 2>/dev/null || true
+	if [ -d functions/rndis.usb0/os_desc/interface.rndis ]; then
+		printf RNDIS >functions/rndis.usb0/os_desc/interface.rndis/compatible_id
+		printf 5162001 >functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id
+	fi
+	ln -s configs/c.1 os_desc 2>/dev/null || true
+
+	if printf '%s' "$udc" >UDC; then
+		sleep 2
+		ifname="$(cat functions/rndis.usb0/ifname 2>/dev/null)"
+		[ -n "$ifname" ] || ifname=usb0
+		ip link set "$ifname" up
+		ip addr flush dev "$ifname" 2>/dev/null || true
+		ip addr add 172.16.42.1/24 dev "$ifname"
+		# If DHCP is filtered or unavailable, Windows chooses an APIPA address;
+		# this second address keeps the phone reachable on the same /16.
+		ip addr add 169.254.42.1/16 dev "$ifname"
+
+		/usr/sbin/dnsmasq --keep-in-foreground --port=0 \
+			--interface="$ifname" --bind-interfaces --dhcp-authoritative \
+			--dhcp-range=172.16.42.2,172.16.42.2,255.255.255.0,1h \
+			--dhcp-option=3,172.16.42.1 \
+			>/run/rmx3630-dnsmasq.log 2>&1 &
+		/bin/busybox nc -lk -p 23 -e /bin/sh \
+			>/run/rmx3630-nc-shell.log 2>&1 &
+
+		state="$(cat "/sys/class/udc/$udc/state" 2>/dev/null)"
+		pmsg_line "USB_READY udc=$udc state=$state if=$ifname"
+	else
+		pmsg_line "USB_BIND_FAILED udc=$udc"
+	fi
+else
+	pmsg_line USB_NO_REAL_UDC
+fi
+
+# At this point either USB debug is available or systemd will provide the next
+# diagnostic.  Cancel the stage-1 rescue timer so a healthy Phosh session is
+# not rebooted after four minutes.
+if [ -r /run/rmx3630-failsafe.pid ]; then
+	failsafe_pid="$(cat /run/rmx3630-failsafe.pid 2>/dev/null)"
+	[ -n "$failsafe_pid" ] && kill "$failsafe_pid" 2>/dev/null || true
+fi
+
+# The modetest preview was useful while bringing KMS up, but stopping it makes
+# the vendor panel driver run a full panel off/on cycle.  That cycle can leave
+# this AMOLED black before Phoc gets DRM master, so keep the preview opt-in.
+if [ -e /etc/rmx3630-enable-kms-preview ] && \
+	[ -x /usr/bin/modetest ] && [ -c /dev/dri/card0 ]; then
+	mkfifo /run/rmx3630-modetest-input
+	exec 3<>/run/rmx3630-modetest-input
+	/usr/bin/modetest -M mediatek -d -c -s 32@69:#0 -F smpte <&3 \
+		>/run/rmx3630-modetest.log 2>&1 &
+	modetest_pid=$!
+	sleep 5
+	if kill -0 "$modetest_pid" 2>/dev/null; then
+		pmsg_line "KMS_HANDOFF pid=$modetest_pid"
+		kill "$modetest_pid" 2>/dev/null || true
+		wait "$modetest_pid" 2>/dev/null || true
+	else
+		pmsg_line KMS_PREVIEW_EXITED
+	fi
+	exec 3>&-
+fi
+
+pmsg_line EXEC_SYSTEMD
+exec /sbin/init

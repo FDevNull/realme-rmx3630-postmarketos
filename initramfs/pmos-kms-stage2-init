@@ -1,0 +1,150 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+mkdir -p /run /tmp /sys/kernel/config
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+
+exec >>/run/rmx3630-pmos-live.log 2>&1
+echo "rmx3630-pmos: persistent KMS/USB session entered" >/dev/kmsg 2>/dev/null || true
+
+pmsg_line() {
+	[ -c /dev/pmsg0 ] || return 0
+	printf '\nRMX3630_LIVE: %s\n' "$*" >/dev/pmsg0 2>/dev/null || true
+}
+
+pmsg_line STAGE2_STARTED
+
+# Put a known image on the panel, then release DRM master so a compositor can
+# replace it later.  A private FIFO keeps modetest's framebuffer alive.
+if [ -c /dev/dri/card0 ]; then
+	mkfifo /run/modetest-input
+	exec 3<>/run/modetest-input
+	/usr/bin/modetest -M mediatek -d -c -s 32@69:#0 -F smpte <&3 \
+		>/run/modetest.log 2>&1 &
+	modetest_pid=$!
+	sleep 5
+	if kill -0 "$modetest_pid" 2>/dev/null; then
+		pmsg_line "KMS_ACTIVE pid=$modetest_pid"
+	else
+		wait "$modetest_pid"
+		pmsg_line "KMS_EXITED status=$?"
+	fi
+	tail -n 12 /run/modetest.log 2>/dev/null \
+		| while IFS= read -r line; do pmsg_line "KMS_LOG $line"; done
+else
+	pmsg_line DRM_CARD0_MISSING
+fi
+
+# Wait for the real MediaTek UDC; ignore dummy_udc from the test controller.
+udc=
+waited=0
+while [ "$waited" -lt 45 ]; do
+	for candidate in /sys/class/udc/*; do
+		[ -e "$candidate" ] || continue
+		name="${candidate##*/}"
+		case "$name" in dummy*) continue ;; esac
+		udc="$name"
+		break
+	done
+	[ -n "$udc" ] && break
+	mdev -s 2>/dev/null || true
+	sleep 1
+	waited=$((waited + 1))
+done
+
+if [ -z "$udc" ]; then
+	pmsg_line USB_NO_REAL_UDC
+	cat /sys/kernel/debug/devices_deferred 2>/dev/null \
+		| tail -n 12 \
+		| while IFS= read -r line; do pmsg_line "DEFERRED $line"; done
+else
+	pmsg_line "USB_UDC_FOUND name=$udc waited=$waited"
+
+	# MediaTek's downstream MUSB exposes its own operation-mode switch even
+	# though the standard usb_role class has no writable role attribute here.
+	# cmode 3 is MUSB_DR_OPERATION_DEVICE and does not need the charger/extcon
+	# stack that crashes in the stripped postmarketOS environment.
+	cmode=/sys/devices/platform/soc/mt_usb/musb-hdrc/cmode
+	if [ -w "$cmode" ] && printf 3 >"$cmode"; then
+		pmsg_line "USB_CMODE value=$(cat "$cmode" 2>/dev/null)"
+	else
+		pmsg_line USB_CMODE_FAILED
+	fi
+
+	mount -t configfs none /sys/kernel/config 2>/dev/null || true
+	g=/sys/kernel/config/usb_gadget/rmx3630
+	mkdir -p "$g"
+	cd "$g" || exit 1
+
+	# Use the conventional Linux RNDIS gadget identity.  Reusing Realme's
+	# Android VID/PID makes Windows bind the existing ADB-only association.
+	printf 0x0525 >idVendor
+	printf 0xa4a2 >idProduct
+	printf 0x0200 >bcdUSB
+	printf 0x0100 >bcdDevice
+	printf 0xEF >bDeviceClass
+	printf 0x02 >bDeviceSubClass
+	printf 0x01 >bDeviceProtocol
+
+	mkdir -p strings/0x409 configs/c.1/strings/0x409
+	printf RMX3630PMOS >strings/0x409/serialnumber
+	printf postmarketOS >strings/0x409/manufacturer
+	printf 'RMX3630 USB debug' >strings/0x409/product
+	printf 'RNDIS debug link' >configs/c.1/strings/0x409/configuration
+	printf 250 >configs/c.1/MaxPower
+
+	mkdir -p functions/rndis.usb0
+	ln -s functions/rndis.usb0 configs/c.1/
+
+	# Microsoft OS descriptors make the standard configfs RNDIS function bind
+	# without asking the user to choose a driver manually.
+	printf 1 >os_desc/use 2>/dev/null || true
+	printf 0xcd >os_desc/b_vendor_code 2>/dev/null || true
+	printf MSFT100 >os_desc/qw_sign 2>/dev/null || true
+	if [ -d functions/rndis.usb0/os_desc/interface.rndis ]; then
+		printf RNDIS >functions/rndis.usb0/os_desc/interface.rndis/compatible_id
+		printf 5162001 >functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id
+	fi
+	ln -s configs/c.1 os_desc 2>/dev/null || true
+
+	if printf '%s' "$udc" >UDC; then
+		mdev -s 2>/dev/null || true
+		sleep 3
+		ifname="$(cat functions/rndis.usb0/ifname 2>/dev/null)"
+		[ -n "$ifname" ] || ifname=usb0
+
+		ip link set "$ifname" up
+		ip addr flush dev "$ifname" 2>/dev/null || true
+		ip addr add 172.16.42.1/24 dev "$ifname"
+
+		cat >/run/udhcpd.conf <<EOF
+start 172.16.42.2
+end 172.16.42.2
+interface $ifname
+option subnet 255.255.255.0
+option router 172.16.42.1
+lease_file /run/udhcpd.leases
+pidfile /run/udhcpd.pid
+EOF
+		touch /run/udhcpd.leases
+		/bin/busybox udhcpd -f /run/udhcpd.conf >/run/udhcpd.log 2>&1 &
+
+		# Unauthenticated shell is restricted to this temporary point-to-point
+		# USB link and is removed once the real userspace is ready.
+		/bin/busybox nc -lk -p 23 -e /bin/sh >/run/nc-shell.log 2>&1 &
+
+		state="$(cat "/sys/class/udc/$udc/state" 2>/dev/null)"
+		pmsg_line "USB_BOUND udc=$udc state=$state if=$ifname ip=172.16.42.1"
+		pmsg_line "USB_SHELL tcp=172.16.42.1:23"
+	else
+		pmsg_line "USB_BIND_FAILED udc=$udc"
+	fi
+fi
+
+# This is now the persistent postmarketOS PID1.  Rebooting from either debug
+# shell returns to the already-successful Android B rescue slot.
+pmsg_line LIVE_SESSION_READY
+while true; do sleep 3600; done

@@ -1,0 +1,13 @@
+[Unit]
+Description=RMX3630 MT6789 Mali-G57 kernel stack
+After=systemd-modules-load.service rmx3630-audio.service
+Wants=rmx3630-audio.service
+Before=rmx3630-phosh-direct.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rmx3630-load-gpu
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

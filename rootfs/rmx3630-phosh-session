@@ -1,0 +1,40 @@
+#!/bin/sh
+# Start the bare Phosh shell together with the services normally supplied by
+# phosh-session/gnome-session.  The RMX3630 port cannot use a VT-backed display
+# manager yet, so these session helpers must share phoc's Wayland and D-Bus
+# environment directly.
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+phosh_pid=
+osk_pid=
+nm_pid=
+
+stop_helpers() {
+	[ -z "$osk_pid" ] || kill "$osk_pid" 2>/dev/null || true
+	[ -z "$nm_pid" ] || kill "$nm_pid" 2>/dev/null || true
+}
+trap stop_helpers EXIT HUP INT TERM
+
+/usr/libexec/phosh &
+phosh_pid=$!
+
+# phoc has created WAYLAND_DISPLAY before executing this script.  A short
+# delay lets Phosh claim its shell protocols before the input method connects.
+sleep 1
+
+if command -v squeekboard >/dev/null 2>&1; then
+	squeekboard >"$runtime_dir/squeekboard.log" 2>&1 &
+	osk_pid=$!
+fi
+
+# Phosh can ask NetworkManager to activate an AP, but a SecretAgent is needed
+# for the WPA password dialog.  nm-applet supplies that agent; its tray icon is
+# harmless when the shell does not expose a traditional notification area.
+if command -v nm-applet >/dev/null 2>&1; then
+	nm-applet --indicator >"$runtime_dir/nm-applet.log" 2>&1 &
+	nm_pid=$!
+fi
+
+wait "$phosh_pid"
+status=$?
+exit "$status"

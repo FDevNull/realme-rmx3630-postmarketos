@@ -1,0 +1,13 @@
+[Unit]
+Description=RMX3630 stock-kernel audio modules
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+Before=rmx3630-phosh-direct.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rmx3630-load-audio
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

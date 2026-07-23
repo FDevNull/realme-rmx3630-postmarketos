@@ -1,0 +1,14 @@
+[Unit]
+Description=RMX3630 select PulseAudio UCM speaker
+After=rmx3630-audio.service rmx3630-phosh-direct.service
+Wants=rmx3630-audio.service rmx3630-phosh-direct.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rmx3630-start-pulse-sink
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+exec >>/run/rmx3630-gpu.log 2>&1
+echo "rmx3630-gpu: loading MT6789 power stack and Panfrost"
+
+gpu_device=/sys/bus/platform/devices/13000000.mali
+
+# Keep the vendor kbase module available for the MediaTek GED/gpufreq stack,
+# but reserve the physical GPU for Panfrost before either driver is loaded.
+if [ -w "$gpu_device/driver_override" ]; then
+	printf '%s' panfrost > "$gpu_device/driver_override"
+fi
+
+# tinysys-scmi exports symbols required by mtk-ssc. fhctl is a device-link
+# supplier of gpufreq; without it the GPU power domain remains deferred.
+modprobe tinysys_scmi
+modprobe fhctl
+modprobe mtk_gpufreq_mt6789
+modprobe mali_kbase_mt6789
+
+modprobe gpu_sched
+modprobe panfrost
+
+count=0
+while [ ! -r /sys/class/drm/renderD128/dev ] && [ "$count" -lt 15 ]; do
+	sleep 1
+	count=$((count + 1))
+done
+
+if [ ! -r /sys/class/drm/renderD128/dev ]; then
+	echo "rmx3630-gpu: Panfrost render node did not appear" >&2
+	exit 1
+fi
+
+install -d -m 0755 /dev/dri
+
+make_dri_node() {
+	name="$1"
+	devnum="$(cat "/sys/class/drm/$name/dev")"
+	major="${devnum%:*}"
+	minor="${devnum#*:}"
+	if [ ! -e "/dev/dri/$name" ]; then
+		mknod "/dev/dri/$name" c "$major" "$minor"
+	fi
+	chown root:video "/dev/dri/$name"
+	chmod 0660 "/dev/dri/$name"
+}
+
+make_dri_node renderD128
+for card in /sys/class/drm/card*; do
+	[ -r "$card/dev" ] || continue
+	make_dri_node "${card##*/}"
+done
+
+echo "rmx3630-gpu: Panfrost ready at $(cat /sys/class/drm/renderD128/dev)"

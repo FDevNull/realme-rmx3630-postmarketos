@@ -1,0 +1,64 @@
+#!/bin/sh
+
+# The downstream Android kernel exports several device nodes without the
+# groups expected by a normal Linux userspace.  mdev -s can also reset them
+# while probing newly loaded vendor modules, so run this before every Phosh
+# start as well as installing matching udev rules.
+
+if [ ! -c /dev/null ]; then
+	rm -f /dev/null
+	mknod -m 0666 /dev/null c 1 3
+fi
+chown root:root /dev/null
+chmod 0666 /dev/null
+
+for node in /dev/dri/card* /dev/dri/renderD*; do
+	[ -c "$node" ] || continue
+	chown root:video "$node"
+	chmod 0660 "$node"
+done
+
+if [ -d /sys/class/input ]; then
+	mkdir -p /dev/input
+	for sysnode in /sys/class/input/event*; do
+		[ -f "$sysnode/dev" ] || continue
+		name=${sysnode##*/}
+		IFS=: read -r major minor < "$sysnode/dev"
+		case "$major:$minor" in
+			*[!0-9:]*) continue ;;
+		esac
+		[ -c "/dev/input/$name" ] ||
+			mknod "/dev/input/$name" c "$major" "$minor"
+	done
+
+	for node in /dev/input/event*; do
+		[ -c "$node" ] || continue
+		chown root:input "$node"
+		chmod 0660 "$node"
+	done
+fi
+
+if [ -c /dev/fuse ]; then
+	chown root:root /dev/fuse
+	chmod 0666 /dev/fuse
+fi
+
+if [ -d /sys/class/sound ]; then
+	mkdir -p /dev/snd
+	for sysnode in /sys/class/sound/*; do
+		[ -f "$sysnode/dev" ] || continue
+		name=${sysnode##*/}
+		IFS=: read -r major minor < "$sysnode/dev"
+		case "$major:$minor" in
+			*[!0-9:]*) continue ;;
+		esac
+		[ -c "/dev/snd/$name" ] ||
+			mknod "/dev/snd/$name" c "$major" "$minor"
+	done
+
+	for node in /dev/snd/*; do
+		[ -c "$node" ] || continue
+		chown root:audio "$node"
+		chmod 0660 "$node"
+	done
+fi

@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+runtime_dir=/run/user/10000
+log=/run/rmx3630-pulse-sink.log
+exec >>"$log" 2>&1
+
+pactl_user() {
+	su user -s /bin/sh -c "XDG_RUNTIME_DIR=$runtime_dir pactl $*"
+}
+
+waited=0
+while [ ! -S "$runtime_dir/pulse/native" ]; do
+	[ "$waited" -ge 45 ] && {
+		echo "rmx3630-pulse: PulseAudio socket did not appear" >&2
+		exit 1
+	}
+	sleep 1
+	waited=$((waited + 1))
+done
+
+sink=alsa_output.platform-soc_sound.HiFi__Speaker__sink
+waited=0
+while ! pactl_user list short sinks | awk -v sink="$sink" '$2 == sink {found=1} END {exit !found}'; do
+	[ "$waited" -ge 45 ] && {
+		echo "rmx3630-pulse: UCM speaker sink did not appear" >&2
+		exit 1
+	}
+	sleep 1
+	waited=$((waited + 1))
+done
+
+pactl_user set-default-sink "$sink"
+pactl_user set-sink-volume "$sink" 70%
+echo "rmx3630-pulse: UCM speaker sink ready"

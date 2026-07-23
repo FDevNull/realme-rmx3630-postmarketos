@@ -1,0 +1,154 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/system/bin
+export PATH
+
+log_file=/run/rmx3630-boot.log
+
+early_log() {
+    echo "rmx3630-init: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+mkdir -p /proc /sys /dev /run /tmp /sys/kernel/config
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid tmpfs /dev 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+
+mknod -m 666 /dev/null c 1 3 2>/dev/null || true
+mknod -m 666 /dev/zero c 1 5 2>/dev/null || true
+mknod -m 666 /dev/random c 1 8 2>/dev/null || true
+mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true
+mknod -m 600 /dev/console c 5 1 2>/dev/null || true
+mknod -m 666 /dev/tty c 5 0 2>/dev/null || true
+mkdir -p /dev/pts
+mount -t devpts -o mode=0620,gid=5 devpts /dev/pts 2>/dev/null || true
+
+exec >>"$log_file" 2>&1
+echo "=== RMX3630 Alpine initramfs $(date 2>/dev/null) ==="
+echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+mdev -s 2>/dev/null || true
+
+early_log "loading stock recovery modules"
+module_list=/lib/modules/modules.load.recovery
+if [ ! -r "$module_list" ]; then
+    module_list=/lib/modules/modules.load
+fi
+
+load_module_pass() {
+    pass="$1"
+    while IFS= read -r module; do
+        case "$module" in
+            ''|'#'*) continue ;;
+        esac
+        if [ ! -f "/lib/modules/$module" ]; then
+            echo "module missing: $module"
+            continue
+        fi
+        if ! insmod "/lib/modules/$module" 2>/run/insmod.err; then
+            error=$(cat /run/insmod.err 2>/dev/null)
+            case "$error" in
+                *exists*|*Exist*) ;;
+                *) echo "module pass $pass failed: $module: $error" ;;
+            esac
+        fi
+    done < "$module_list"
+}
+
+if [ -r "$module_list" ]; then
+    # The stock list is dependency ordered, except for a few soft dependencies.
+    # A second pass loads modules whose prerequisite appeared later in pass one.
+    load_module_pass 1
+    load_module_pass 2
+else
+    echo "No vendor module load list found"
+fi
+
+mdev -s 2>/dev/null || true
+sleep 2
+
+early_log "configuring USB RNDIS gadget"
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+gadget=/sys/kernel/config/usb_gadget/rmx3630
+mkdir -p "$gadget"
+echo 0x18d1 > "$gadget/idVendor" 2>/dev/null || true
+echo 0x4ee3 > "$gadget/idProduct" 2>/dev/null || true
+echo 0x0200 > "$gadget/bcdUSB" 2>/dev/null || true
+echo 0x0100 > "$gadget/bcdDevice" 2>/dev/null || true
+
+mkdir -p "$gadget/strings/0x409"
+echo RMX3630LINUX > "$gadget/strings/0x409/serialnumber" 2>/dev/null || true
+echo Codex > "$gadget/strings/0x409/manufacturer" 2>/dev/null || true
+echo 'RMX3630 Alpine bring-up' > "$gadget/strings/0x409/product" 2>/dev/null || true
+
+mkdir -p "$gadget/configs/c.1/strings/0x409"
+echo RNDIS > "$gadget/configs/c.1/strings/0x409/configuration" 2>/dev/null || true
+echo 250 > "$gadget/configs/c.1/MaxPower" 2>/dev/null || true
+mkdir -p "$gadget/functions/rndis.usb0" "$gadget/functions/acm.GS0"
+echo 02:00:00:00:42:01 > "$gadget/functions/rndis.usb0/dev_addr" 2>/dev/null || true
+echo 02:00:00:00:42:02 > "$gadget/functions/rndis.usb0/host_addr" 2>/dev/null || true
+ln -s "$gadget/functions/rndis.usb0" "$gadget/configs/c.1/rndis.usb0" 2>/dev/null || true
+ln -s "$gadget/functions/acm.GS0" "$gadget/configs/c.1/acm.GS0" 2>/dev/null || true
+
+udc=''
+for candidate in /sys/class/udc/*; do
+    if [ -e "$candidate" ]; then
+        udc=${candidate##*/}
+        break
+    fi
+done
+
+if [ -n "$udc" ]; then
+    echo 2 > "/sys/class/udc/$udc/device/cmode" 2>/dev/null || true
+    echo "$udc" > "$gadget/UDC" 2>/dev/null || true
+    echo "USB gadget bound to $udc"
+else
+    echo "No UDC found under /sys/class/udc"
+fi
+
+sleep 3
+mdev -s 2>/dev/null || true
+
+# CDC ACM gives us a shell even if Windows does not bind its RNDIS driver.
+(
+    count=0
+    while [ ! -c /dev/ttyGS0 ] && [ "$count" -lt 30 ]; do
+        mdev -s 2>/dev/null || true
+        sleep 1
+        count=$((count + 1))
+    done
+    if [ -c /dev/ttyGS0 ]; then
+        while true; do
+            stty -F /dev/ttyGS0 115200 raw -echo 2>/dev/null || true
+            setsid /bin/sh -c 'exec /bin/sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1'
+            sleep 1
+        done
+    fi
+) &
+
+ip link set usb0 up 2>/dev/null || ifconfig usb0 up 2>/dev/null || true
+ip addr add 172.16.42.1/24 dev usb0 2>/dev/null || ifconfig usb0 172.16.42.1 netmask 255.255.255.0 2>/dev/null || true
+
+cat > /run/udhcpd.conf <<'EOF'
+start 172.16.42.2
+end 172.16.42.20
+interface usb0
+option subnet 255.255.255.0
+option lease 3600
+lease_file /run/udhcpd.leases
+pidfile /run/udhcpd.pid
+EOF
+touch /run/udhcpd.leases
+
+/bin/busybox-extras udhcpd /run/udhcpd.conf 2>/dev/null &
+/bin/busybox-extras telnetd -F -p 23 -l /bin/sh 2>/dev/null &
+
+early_log "Alpine is ready on ttyGS0 and 172.16.42.1:23"
+echo "Alpine Linux is ready; CDC ACM shell plus USB telnet 172.16.42.1:23"
+echo "Kernel: $(uname -a)"
+echo "UDC: ${udc:-none}"
+
+while true; do
+    sleep 3600
+done

@@ -1,0 +1,14 @@
+[Unit]
+Description=RMX3630 AMOLED soft power-key blanking
+Requires=rmx3630-input.service
+After=rmx3630-input.service
+Before=rmx3630-phosh-direct.service graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rmx3630-softpower
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

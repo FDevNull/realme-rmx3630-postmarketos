@@ -1,0 +1,33 @@
+[Unit]
+Description=RMX3630 Phosh session without Linux virtual terminals
+After=systemd-udevd.service dbus.service local-fs.target rmx3630-audio.service rmx3630-input.service rmx3630-softpower.service rmx3630-gpu.service
+Wants=systemd-udevd.service dbus.service rmx3630-audio.service rmx3630-input.service rmx3630-softpower.service
+Requires=rmx3630-gpu.service
+Conflicts=greetd.service
+
+[Service]
+Type=exec
+User=user
+Group=user
+SupplementaryGroups=video audio input feedbackd
+Environment=HOME=/home/user
+Environment=USER=user
+Environment=XDG_RUNTIME_DIR=/run/user/10000
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_SEAT=seat0
+Environment=LIBSEAT_BACKEND=noop
+Environment=WLR_RENDERER=gles2
+Environment=WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+Environment=WLR_BACKENDS=drm,libinput
+Environment=WLR_DRM_DEVICES=/dev/dri/card0
+Environment=WLR_DRM_NO_MODIFIERS=1
+Environment=WLR_NO_HARDWARE_CURSORS=1
+Environment=GSK_RENDERER=cairo
+ExecStartPre=+/usr/local/sbin/rmx3630-fix-device-permissions
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/phoc -v -S -C /etc/phosh/rmx3630-phoc.ini -E /usr/local/bin/rmx3630-phosh-session
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical.target

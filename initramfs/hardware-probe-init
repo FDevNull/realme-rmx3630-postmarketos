@@ -1,0 +1,158 @@
+#!/bin/busybox sh
+
+PATH=/bin
+export PATH
+/bin/busybox --install -s /bin
+
+mkdir -p /proc /sys /dev /run /tmp /sys/kernel/debug
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid tmpfs /dev 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+
+mknod -m 666 /dev/null c 1 3 2>/dev/null || true
+mknod -m 600 /dev/console c 5 1 2>/dev/null || true
+pmsg_major="$(awk '$2 == "pmsg" { print $1; exit }' /proc/devices 2>/dev/null)"
+if [ -n "$pmsg_major" ]; then
+    mknod -m 222 /dev/pmsg0 c "$pmsg_major" 0 2>/dev/null || true
+    printf '\nRMX3630_HWPROBE: EARLY_PID1_STARTED\n' >/dev/pmsg0 2>/dev/null || true
+fi
+
+exec >>/run/rmx3630-hwprobe.log 2>&1
+echo "=== RMX3630 autonomous hardware probe ==="
+echo "rmx3630-hwprobe: PID 1 started" >/dev/kmsg 2>/dev/null || true
+mdev -s 2>/dev/null || true
+
+pmsg_line() {
+    [ -c /dev/pmsg0 ] || return 0
+    printf '\nRMX3630_HWPROBE: %s\n' "$*" >/dev/pmsg0 2>/dev/null || true
+}
+
+save_log() {
+    reason="$1"
+    [ -c /dev/pmsg0 ] || return 0
+    {
+        printf '\nRMX3630_HWPROBE: %s\n' "$reason"
+        cat /run/rmx3630-hwprobe.log
+        printf '\nRMX3630_HWPROBE: END_LOG\n'
+    } >/dev/pmsg0 2>/dev/null || true
+}
+
+# Always recover to the known-good B slot even if a probe process blocks.
+(
+    sleep 75
+    pmsg_line FAILSAFE_REBOOT
+    save_log FAILSAFE_REBOOT
+    sync
+    reboot -f
+    sleep 60
+) &
+
+load_one() {
+    module="$1"
+    path="/lib/modules/$module"
+    if [ ! -f "$path" ]; then
+        echo "missing module: $module"
+        pmsg_line "MISSING $module"
+        return
+    fi
+
+    echo "loading $module"
+    pmsg_line "LOAD $module"
+    insmod "$path" &
+    pid=$!
+    elapsed=0
+    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 5 ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "module timed out: $module"
+        pmsg_line "TIMEOUT $module"
+        kill -9 "$pid" 2>/dev/null || true
+    elif wait "$pid" 2>/dev/null; then
+        pmsg_line "DONE $module"
+    else
+        echo "module returned an error: $module"
+        pmsg_line "ERROR $module"
+    fi
+}
+
+while IFS= read -r module; do
+    case "$module" in
+        ''|'#'*) continue ;;
+    esac
+    load_one "$module"
+    mdev -s 2>/dev/null || true
+done </lib/modules/modules.load.probe
+
+sleep 3
+mdev -s 2>/dev/null || true
+
+echo "=== SYSTEM ==="
+uname -a
+cat /proc/cmdline
+
+echo "=== PARTITIONS ==="
+cat /proc/partitions
+for block in /sys/class/block/*; do
+    [ -e "$block" ] || continue
+    name="${block##*/}"
+    echo "$name dev=$(cat "$block/dev" 2>/dev/null) size=$(cat "$block/size" 2>/dev/null) ro=$(cat "$block/ro" 2>/dev/null)"
+done
+
+echo "=== UFS ==="
+for ufs in /sys/bus/platform/devices/*ufs* /sys/bus/platform/devices/11270000.*; do
+    [ -e "$ufs" ] || continue
+    echo "${ufs##*/} driver=$(readlink -f "$ufs/driver" 2>/dev/null)"
+done
+for host in /sys/class/scsi_host/host*; do
+    [ -e "$host" ] || continue
+    echo "${host##*/} proc_name=$(cat "$host/proc_name" 2>/dev/null) state=$(cat "$host/state" 2>/dev/null)"
+done
+
+echo "=== INPUT ==="
+for input in /sys/class/input/input*; do
+    [ -e "$input" ] || continue
+    echo "${input##*/}: $(cat "$input/name" 2>/dev/null)"
+done
+
+echo "=== DISPLAY ==="
+ls -la /sys/class/drm 2>&1 || true
+ls -la /sys/class/graphics 2>&1 || true
+ls -la /sys/class/backlight 2>&1 || true
+
+echo "=== POWER ==="
+for supply in /sys/class/power_supply/*; do
+    [ -e "$supply" ] || continue
+    echo "${supply##*/}: type=$(cat "$supply/type" 2>/dev/null) status=$(cat "$supply/status" 2>/dev/null) capacity=$(cat "$supply/capacity" 2>/dev/null)"
+done
+
+echo "=== NETWORK ==="
+for net in /sys/class/net/*; do
+    [ -e "$net" ] || continue
+    echo "${net##*/}: address=$(cat "$net/address" 2>/dev/null) state=$(cat "$net/operstate" 2>/dev/null)"
+done
+
+echo "=== DEFERRED ==="
+cat /sys/kernel/debug/devices_deferred 2>&1 || true
+for device in /sys/bus/platform/devices/10006000.power-controller \
+              /sys/bus/platform/devices/11270000.ufshci; do
+    [ -e "$device" ] || continue
+    echo "--- ${device##*/} suppliers"
+    for link in "$device"/supplier:*; do
+        [ -e "$link" ] || continue
+        devlink="$(readlink -f "$link" 2>/dev/null)"
+        supplier="$(readlink -f "$devlink/supplier" 2>/dev/null)"
+        echo "${link##*/}: device=$supplier driver=$(readlink -f "$supplier/driver" 2>/dev/null)"
+    done
+done
+
+pmsg_line PROBE_COMPLETE
+save_log PROBE_COMPLETE
+sync
+sleep 5
+reboot -f
+sleep 60

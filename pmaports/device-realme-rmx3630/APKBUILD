@@ -1,0 +1,35 @@
+# Reference: <https://postmarketos.org/devicepkg>
+maintainer=""
+pkgname=device-realme-rmx3630
+pkgdesc="Realme 10 4G"
+pkgver=1
+pkgrel=1
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+depends="
+	linux-realme-rmx3630
+	postmarketos-base
+	postmarketos-base-downstream
+"
+makedepends="devicepkg-dev"
+source="
+	deviceinfo
+	rmx3630-pmos-probe
+"
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+	install -Dm755 "$srcdir/rmx3630-pmos-probe" \
+		"$pkgdir/sbin/rmx3630-pmos-probe"
+}
+
+sha512sums="
+0fa3aa3ef5409433137cb0a50b795be993963bdfca896cbd3f6e6965f7b16968a4d236222fe82b5d04f45ae1570afd4319189be48da889b716582f474a748206  deviceinfo
+8e73ce96fbf29c98fe86d895eb6ada5c14e6bd9d52f35eaa50909ebf323324d9d343e9cc4195c89b87228b0ee6fcf6d4a848561e88fe48241bc036e19aa9f741  rmx3630-pmos-probe
+"

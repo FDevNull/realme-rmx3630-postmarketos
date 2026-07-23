@@ -1,0 +1,7 @@
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="video", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", GROUP="input", MODE="0660"
+KERNEL=="mali0", GROUP="video", MODE="0660"
+SUBSYSTEM=="sound", GROUP="audio", MODE="0660"
+KERNEL=="fuse", MODE="0666"
+KERNEL=="null", MODE="0666"

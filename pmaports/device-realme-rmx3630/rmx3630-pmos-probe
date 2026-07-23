@@ -1,0 +1,36 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+mkdir -p /run /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+
+exec >>/run/rmx3630-pmos-probe.log 2>&1
+echo "rmx3630-pmos: postmarketOS PID 1 entered after switch_root" \
+	>/dev/kmsg 2>/dev/null || true
+
+if [ -c /dev/pmsg0 ]; then
+	{
+		printf '\nRMX3630_PMOS: SWITCH_ROOT_OK\n'
+		echo "pid=$$"
+		echo "uname=$(uname -a)"
+		echo "--- os-release"
+		cat /etc/os-release
+		echo "--- apk"
+		apk --version
+		echo "--- root mount"
+		grep ' / ' /proc/mounts
+		printf 'RMX3630_PMOS: USERSPACE_PROBE_OK\n'
+	} >/dev/pmsg0 2>/dev/null || true
+fi
+
+sleep 12
+if [ -c /dev/pmsg0 ]; then
+	printf '\nRMX3630_PMOS: CLEAN_REBOOT_TO_ANDROID_B\n' \
+		>/dev/pmsg0 2>/dev/null || true
+fi
+sync
+/bin/busybox reboot -f
+sleep 60

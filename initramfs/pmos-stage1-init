@@ -1,0 +1,153 @@
+#!/bin/busybox sh
+
+PATH=/bin
+export PATH
+/bin/busybox --install -s /bin
+
+mkdir -p /proc /sys /dev /run /tmp /sys/kernel/debug /newroot
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid tmpfs /dev 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+rm -f /dev/null
+mknod -m 666 /dev/null c 1 3
+mknod -m 600 /dev/console c 5 1 2>/dev/null || true
+
+pmsg_major="$(awk '$2 == "pmsg" { print $1; exit }' /proc/devices 2>/dev/null)"
+if [ -n "$pmsg_major" ]; then
+	mknod -m 222 /dev/pmsg0 c "$pmsg_major" 0 2>/dev/null || true
+	printf '\nRMX3630_PMOS_STAGE1: PID1_STARTED\n' >/dev/pmsg0 2>/dev/null || true
+fi
+
+exec >>/run/rmx3630-pmos-stage1.log 2>&1
+mdev -s 2>/dev/null || true
+
+pmsg_line() {
+	[ -c /dev/pmsg0 ] || return 0
+	printf '\nRMX3630_PMOS_STAGE1: %s\n' "$*" >/dev/pmsg0 2>/dev/null || true
+}
+
+save_log() {
+	reason="$1"
+	[ -c /dev/pmsg0 ] || return 0
+	{
+		printf '\nRMX3630_PMOS_STAGE1: %s\n' "$reason"
+		cat /run/rmx3630-pmos-stage1.log
+		printf '\nRMX3630_PMOS_STAGE1: END_LOG\n'
+	} >/dev/pmsg0 2>/dev/null || true
+}
+
+(
+	sleep 240
+	pmsg_line FAILSAFE_REBOOT
+	save_log FAILSAFE_REBOOT
+	sync
+	reboot -f
+	sleep 60
+) &
+failsafe_pid=$!
+
+load_one() {
+	module="$1"
+	path="/lib/modules/$module"
+	if [ ! -f "$path" ]; then
+		pmsg_line "MISSING $module"
+		return
+	fi
+	pmsg_line "LOAD $module"
+	insmod "$path" &
+	pid=$!
+	elapsed=0
+	while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 5 ]; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		pmsg_line "TIMEOUT $module"
+		kill -9 "$pid" 2>/dev/null || true
+	elif wait "$pid" 2>/dev/null; then
+		pmsg_line "DONE $module"
+	else
+		pmsg_line "ERROR $module"
+	fi
+	mdev -s 2>/dev/null || true
+}
+
+while IFS= read -r module; do
+	case "$module" in
+		''|'#'*) continue ;;
+	esac
+	load_one "$module"
+done </lib/modules/modules.load.probe
+
+# Keep the display diagnostics compact enough for the small persistent pmsg
+# ring. Full driver output is also preserved by ramoops in console-ramoops.
+if [ -c /dev/dri/card0 ]; then
+	pmsg_line DRM_CARD0_OK
+else
+	pmsg_line DRM_CARD0_MISSING
+fi
+for node in /sys/class/drm/card*-*/status /sys/class/drm/card*-*/enabled; do
+	[ -f "$node" ] || continue
+	pmsg_line "DRM $(basename "$(dirname "$node")") $(basename "$node")=$(cat "$node" 2>/dev/null)"
+done
+
+retry=0
+while [ ! -b /dev/sdc70 ] && [ "$retry" -lt 15 ]; do
+	mdev -s 2>/dev/null || true
+	sleep 1
+	retry=$((retry + 1))
+done
+
+if [ ! -b /dev/sdc70 ]; then
+	save_log SUPER_BLOCK_MISSING
+	sync
+	reboot -f
+	sleep 60
+fi
+
+# my_preload_b is a single linear dynamic-partition extent in super:
+# physical sector 10420224, length 1158472 sectors, sector size 512 bytes.
+mknod -m 660 /dev/loop0 b 7 0 2>/dev/null || true
+if ! losetup -o 5335154688 /dev/loop0 /dev/sdc70; then
+	save_log LOOP_SETUP_FAILED
+	sync
+	reboot -f
+	sleep 60
+fi
+
+if ! mount -t ext4 -o ro /dev/loop0 /newroot; then
+	save_log ROOT_MOUNT_FAILED
+	losetup -d /dev/loop0 2>/dev/null || true
+	sync
+	reboot -f
+	sleep 60
+fi
+
+stage2=/sbin/rmx3630-pmos-probe
+if [ -x /newroot/sbin/rmx3630-pmos-kms-probe ]; then
+	stage2=/sbin/rmx3630-pmos-kms-probe
+fi
+if [ ! -x "/newroot$stage2" ]; then
+	save_log PMOS_PROBE_MISSING
+	umount /newroot 2>/dev/null || true
+	losetup -d /dev/loop0 2>/dev/null || true
+	sync
+	reboot -f
+	sleep 60
+fi
+
+pmsg_line SWITCH_ROOT
+# From this point the real postmarketOS PID1 owns recovery.  Keep the timed
+# fallback for all earlier mount/module failures, but do not reboot a healthy
+# interactive session out from under the developer.
+kill "$failsafe_pid" 2>/dev/null || true
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+mount --move /run /newroot/run
+mount --move /tmp /newroot/tmp
+exec switch_root -c /dev/console /newroot "$stage2"

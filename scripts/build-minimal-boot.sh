@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dumps_dir="${DUMPS_DIR:-/mnt/c/UnlockTool/fff}"
+work_dir="${WORK_DIR:-/home/valtos/rmx3630-port-work}"
+tools_dir="$work_dir/tools"
+stock_boot_dir="$work_dir/stock-unpacked/boot_a"
+stock_vendor_root="$work_dir/stock-unpacked/vendor-ramdisk-root"
+static_root="$work_dir/busybox-static-root"
+build_dir="$work_dir/minimal-initramfs"
+rootfs_dir="$build_dir/rootfs"
+output_dir="${OUTPUT_DIR:-$project_dir/out}"
+kernel_image="${KERNEL_IMAGE:-$stock_boot_dir/kernel}"
+output_basename="${OUTPUT_BASENAME:-rmx3630-minimal-test-boot}"
+init_file="${INIT_FILE:-$project_dir/initramfs/minimal-init}"
+module_list_file="${MODULE_LIST_FILE:-$project_dir/initramfs/modules.load.minimal}"
+
+for required in \
+    "$dumps_dir/boot_a.img" \
+    "$init_file" \
+    "$module_list_file"; do
+    if [[ ! -f "$required" ]]; then
+        echo "Missing required file: $required" >&2
+        exit 2
+    fi
+done
+
+mkdir -p "$tools_dir" "$output_dir"
+if [[ ! -d "$tools_dir/mkbootimg/.git" ]]; then
+    git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg "$tools_dir/mkbootimg"
+fi
+if [[ ! -d "$tools_dir/avb/.git" ]]; then
+    git clone --depth 1 https://android.googlesource.com/platform/external/avb "$tools_dir/avb"
+fi
+
+if [[ ! -x "$static_root/bin/busybox.static" ]]; then
+    case "$static_root" in
+        /home/valtos/rmx3630-port-work/*) ;;
+        *) echo "Refusing unsafe static BusyBox directory: $static_root" >&2; exit 2 ;;
+    esac
+    rm -rf -- "$static_root"
+    mkdir -p "$static_root"
+    "$tools_dir/apk.static" \
+        --root "$static_root" \
+        --initdb \
+        --arch aarch64 \
+        --repository https://dl-cdn.alpinelinux.org/alpine/v3.22/main \
+        --allow-untrusted \
+        --no-scripts \
+        add busybox-static
+fi
+
+if [[ ! -f "$stock_boot_dir/kernel" ]]; then
+    mkdir -p "$stock_boot_dir"
+    python3 "$tools_dir/mkbootimg/unpack_bootimg.py" \
+        --boot_img "$dumps_dir/boot_a.img" \
+        --out "$stock_boot_dir"
+fi
+
+if [[ ! -f "$kernel_image" ]]; then
+    echo "Missing kernel image: $kernel_image" >&2
+    exit 2
+fi
+
+case "$build_dir" in
+    /home/valtos/rmx3630-port-work/*) ;;
+    *) echo "Refusing unsafe build directory: $build_dir" >&2; exit 2 ;;
+esac
+rm -rf -- "$build_dir"
+mkdir -p "$rootfs_dir/bin" "$rootfs_dir/lib/modules" "$rootfs_dir/proc" \
+    "$rootfs_dir/sys" "$rootfs_dir/dev" "$rootfs_dir/run" "$rootfs_dir/tmp"
+
+# The RMX3630 LK unconditionally treats the boot-v4 kernel payload as gzip.
+# Passing a raw arm64 Image makes LK panic before Linux starts with
+# "gzip header is not correct" / "decompress kernel image fail".
+kernel_for_boot="$kernel_image"
+kernel_magic="$(od -An -tx1 -N2 "$kernel_image" | tr -d ' \n')"
+if [[ "$kernel_magic" != "1f8b" ]]; then
+    kernel_for_boot="$build_dir/kernel.gz"
+    gzip -n -9 -c "$kernel_image" >"$kernel_for_boot"
+fi
+gzip -t "$kernel_for_boot"
+
+install -m 0755 "$static_root/bin/busybox.static" "$rootfs_dir/bin/busybox"
+install -m 0755 "$init_file" "$rootfs_dir/init"
+install -m 0644 "$module_list_file" \
+    "$rootfs_dir/lib/modules/modules.load.probe"
+
+# Load only the dependency-first USB bring-up set. Loading the first 138
+# recovery modules also starts hang detectors, DRM and IOMMU services that can
+# deadlock a deliberately tiny initramfs long before the USB controller.
+while IFS= read -r module; do
+    case "$module" in
+        ''|'#'*) continue ;;
+    esac
+    if [[ -f "$stock_vendor_root/lib/modules/$module" ]]; then
+        module_source="$stock_vendor_root/lib/modules/$module"
+    elif [[ -f "$project_dir/out/$module" ]]; then
+        module_source="$project_dir/out/$module"
+    else
+        echo "Missing module from stock and project output: $module" >&2
+        exit 3
+    fi
+    install -m 0644 "$module_source" "$rootfs_dir/lib/modules/$module"
+done <"$rootfs_dir/lib/modules/modules.load.probe"
+
+ramdisk="$build_dir/rmx3630-minimal-initramfs.cpio.lz4"
+(
+    cd "$rootfs_dir"
+    find . -print0 \
+        | sort -z \
+        | cpio --null --create --format=newc --owner=0:0 2>/dev/null \
+        | lz4 -l -12 - "$ramdisk"
+)
+
+raw_output="$output_dir/${output_basename}-raw.img"
+output="$output_dir/${output_basename}.img"
+rm -f -- "$raw_output" "$output" "$output.sha256"
+python3 "$tools_dir/mkbootimg/mkbootimg.py" \
+    --header_version 4 \
+    --os_version 12.0.0 \
+    --os_patch_level 2025-03 \
+    --kernel "$kernel_for_boot" \
+    --ramdisk "$ramdisk" \
+    --cmdline 'rdinit=/init panic=10 loglevel=8 ignore_loglevel printk.devkmsg=on' \
+    --gki_signing_algorithm SHA256_RSA2048 \
+    --gki_signing_key "$tools_dir/mkbootimg/tests/data/testkey_rsa2048.pem" \
+    --gki_signing_avbtool_path "$tools_dir/avb/avbtool.py" \
+    --output "$raw_output"
+
+# Realme's stock boot-v4 header declares a 4096-byte boot_signature section,
+# but the section itself is all zeroes. Keep the declared layout generated by
+# mkbootimg and replace the temporary GKI test signature with the exact stock
+# representation. LK on this device is sensitive to the section being present
+# even though AVB authentication is disabled for the unlocked test slot.
+raw_size=$(stat -c '%s' "$raw_output")
+if (( raw_size < 4096 || raw_size % 4096 != 0 )); then
+    echo "Unexpected signed boot image size: $raw_size" >&2
+    exit 3
+fi
+dd if=/dev/zero of="$raw_output" bs=4096 count=1 \
+    seek=$((raw_size / 4096 - 1)) conv=notrunc status=none
+
+partition_size=$((64 * 1024 * 1024))
+raw_size=$(stat -c '%s' "$raw_output")
+if (( raw_size > partition_size )); then
+    echo "Boot image is too large: $raw_size > $partition_size" >&2
+    exit 3
+fi
+
+cp -- "$raw_output" "$output"
+python3 "$tools_dir/avb/avbtool.py" add_hash_footer \
+    --image "$output" \
+    --partition_name boot \
+    --partition_size "$partition_size" \
+    --algorithm SHA256_RSA2048 \
+    --key "$tools_dir/mkbootimg/tests/data/testkey_rsa2048.pem" \
+    --prop com.android.build.boot.os_version:12 \
+    --prop com.android.build.boot.security_patch:2025-03-01
+
+sha256sum "$output" | tee "$output.sha256"
+printf 'Built raw image %s (%s bytes)\n' "$raw_output" "$raw_size"
+printf 'Built AVB image %s (%s bytes)\n' "$output" "$(stat -c '%s' "$output")"

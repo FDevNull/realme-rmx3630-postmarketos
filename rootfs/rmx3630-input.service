@@ -1,0 +1,12 @@
+[Unit]
+Description=RMX3630 stock-kernel hardware key modules
+After=local-fs.target systemd-udevd.service
+Before=rmx3630-phosh-direct.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rmx3630-load-input
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

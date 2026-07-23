@@ -1,0 +1,37 @@
+# Local build and reverse-engineering workspaces
+/out/
+/tools/
+
+# Stock/proprietary artifacts extracted from a phone
+/pmaports/linux-realme-rmx3630/stock-kernel.gz
+/pmaports/pmbootstrap-v2606.cfg
+/rootfs/sipa.bin
+*.img
+*.bin
+*.elf
+*.apk
+*.zip
+*.tar
+*.cpio
+*.lz4
+*.ko
+
+# Kernel module build output; keep only authored sources and Makefiles
+kernel-modules/**/*.o
+kernel-modules/**/*.mod
+kernel-modules/**/*.mod.c
+kernel-modules/**/Module.symvers
+kernel-modules/**/modules.order
+kernel-modules/**/.*.cmd
+kernel-modules/**/.tmp_versions/
+
+# Local caches and logs
+__pycache__/
+*.py[cod]
+*.log
+.cache/
+.venv/
+
+# Temporary root-level copies superseded by rootfs/
+/rmx3630-phosh-direct.service
+/rmx3630-phosh-session

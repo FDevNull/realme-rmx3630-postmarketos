@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Minimal userspace companion for the legacy MediaTek WMT driver."""
+
+import fcntl
+import os
+import select
+import signal
+import struct
+import sys
+import threading
+import time
+
+
+DEVICE = "/dev/stpwmt"
+PATCH_PATH = b"/vendor/firmware/"
+
+# These ioctl numbers come from the stock MT6789 wmt_dev.c ABI.
+WMT_IOCTL_SET_PATCH_NAME = 0x4008A004
+WMT_IOCTL_SET_STP_MODE = 0x4004A005
+WMT_IOCTL_SET_LAUNCHER_KILL = 0x4004A00D
+WMT_IOCTL_SET_ROM_PATCH_INFO = 0x4008A01F
+WMT_IOCTL_LPBK_POWER_CTRL = 0x4004A007
+
+# Low nibble 3 = BTIF, high nibble 2 = FM over the common WMT interface.
+STP_BTIF_WITH_FM_COMM = 0x23
+
+# MT6789 reports A-die 0x6631, which the stock launcher maps to 1d_1.
+ROM_PATCHES = (
+    "soc2_2_ram_bt_1d_1_hdr.bin",
+    "soc2_2_ram_wifi_1d_1_hdr.bin",
+    "soc2_2_ram_mcu_1d_1_hdr.bin",
+)
+
+running = True
+
+
+def stop(_signum, _frame):
+    global running
+    running = False
+
+
+def wait_open():
+    while running:
+        try:
+            return os.open(DEVICE, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as error:
+            print(f"waiting for {DEVICE}: {error}", flush=True)
+            time.sleep(0.5)
+    raise SystemExit(0)
+
+
+def register_rom_patches(fd):
+    for name in ROM_PATCHES:
+        path = os.path.join(PATCH_PATH.decode(), name)
+        with open(path, "rb") as patch_file:
+            header = patch_file.read(32)
+        if len(header) != 32:
+            raise RuntimeError(f"short ROM patch header: {path}")
+
+        # Bytes 24..31 are the stock launcher's eight-byte patch descriptor.
+        descriptor = header[24:32]
+        patch_type = descriptor[7]
+        address = bytearray(descriptor[:4])
+        address[0] = 0
+        encoded_name = name.encode()
+        if len(encoded_name) >= 256:
+            raise RuntimeError(f"ROM patch name is too long: {name}")
+        info = bytearray(struct.pack("<I4s256s", patch_type, address, encoded_name))
+        fcntl.ioctl(fd, WMT_IOCTL_SET_ROM_PATCH_INFO, info, True)
+        print(
+            f"registered ROM patch type={patch_type} "
+            f"address={bytes(address).hex()} name={name}",
+            flush=True,
+        )
+
+
+def power_on_connsys(fd):
+    """Match stock wmt_launcher -o 1: keep the WMT core powered via LPBK."""
+    for attempt in range(20):
+        try:
+            fcntl.ioctl(fd, WMT_IOCTL_LPBK_POWER_CTRL, 2)
+            print("WMT LPBK power-on succeeded", flush=True)
+            return
+        except OSError as error:
+            try:
+                fcntl.ioctl(fd, WMT_IOCTL_LPBK_POWER_CTRL, 0)
+            except OSError:
+                pass
+            print(
+                f"WMT LPBK power-on failed: {error}; retry {attempt + 1}/20",
+                flush=True,
+            )
+            time.sleep(1)
+    print("WMT LPBK power-on exhausted all retries", file=sys.stderr, flush=True)
+
+
+def main():
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    fd = wait_open()
+    try:
+        patch_buffer = bytearray(256)
+        patch_buffer[: len(PATCH_PATH)] = PATCH_PATH
+        fcntl.ioctl(fd, WMT_IOCTL_SET_PATCH_NAME, patch_buffer, True)
+        fcntl.ioctl(fd, WMT_IOCTL_SET_STP_MODE, STP_BTIF_WITH_FM_COMM)
+        fcntl.ioctl(fd, WMT_IOCTL_SET_LAUNCHER_KILL, 0)
+        register_rom_patches(fd)
+        print("WMT userspace ready: BTIF mode 0x23", flush=True)
+
+        power_thread = threading.Thread(
+            target=power_on_connsys,
+            args=(fd,),
+            name="wmt-power-on",
+            daemon=True,
+        )
+        power_thread.start()
+
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+        while running:
+            for _descriptor, events in poller.poll(1000):
+                if events & select.POLLIN:
+                    try:
+                        command = os.read(fd, 255)
+                    except BlockingIOError:
+                        continue
+                    if command:
+                        print(f"WMT command: {command!r}", flush=True)
+                        os.write(fd, b"ok")
+                if events & (select.POLLERR | select.POLLHUP):
+                    raise RuntimeError(f"WMT poll failed: events=0x{events:x}")
+    finally:
+        try:
+            fcntl.ioctl(fd, WMT_IOCTL_SET_LAUNCHER_KILL, 1)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"rmx3630-wmt-launcher: {error}", file=sys.stderr, flush=True)
+        raise

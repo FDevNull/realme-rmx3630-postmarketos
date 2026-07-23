@@ -1,0 +1,227 @@
+#!/bin/busybox sh
+
+PATH=/bin
+export PATH
+
+/bin/busybox --install -s /bin
+
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /sys/kernel/config /sys/kernel/debug
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid tmpfs /dev 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+
+mknod -m 666 /dev/null c 1 3 2>/dev/null || true
+mknod -m 666 /dev/zero c 1 5 2>/dev/null || true
+mknod -m 666 /dev/random c 1 8 2>/dev/null || true
+mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true
+mknod -m 600 /dev/console c 5 1 2>/dev/null || true
+mknod -m 666 /dev/tty c 5 0 2>/dev/null || true
+
+# Do not rely on mdev for the earliest persistent marker. The pmsg major is
+# dynamically allocated, so resolve it from proc and create the node before
+# any driver/module probing can hang.
+pmsg_major="$(awk '$2 == "pmsg" { print $1; exit }' /proc/devices 2>/dev/null)"
+if [ -n "$pmsg_major" ]; then
+    mknod -m 222 /dev/pmsg0 c "$pmsg_major" 0 2>/dev/null || true
+    printf '\nRMX3630_MINIMAL: EARLY_PID1_STARTED\n' >/dev/pmsg0 2>/dev/null || true
+fi
+
+mount -t devpts -o mode=0620,gid=5 devpts /dev/pts 2>/dev/null || true
+mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+
+exec >>/run/rmx3630-minimal.log 2>&1
+echo "=== RMX3630 static initramfs ==="
+echo "rmx3630-minimal: PID 1 started" >/dev/kmsg 2>/dev/null || true
+[ ! -e /proc/sys/kernel/hotplug ] || echo /bin/mdev >/proc/sys/kernel/hotplug 2>/dev/null || true
+mdev -s 2>/dev/null || true
+
+# pmsg is backed by the same ramoops reservation that stock Android collects
+# on the following boot. It gives us a persistent trace even when USB never
+# enumerates and the phone has to be reset by hand.
+if [ -c /dev/pmsg0 ]; then
+    printf '\nRMX3630_MINIMAL: PID1_STARTED\n' >/dev/pmsg0 2>/dev/null || true
+fi
+
+save_pmsg_log() {
+    reason="$1"
+    if [ -c /dev/pmsg0 ]; then
+        {
+            printf '\nRMX3630_MINIMAL: %s\n' "$reason"
+            cat /run/rmx3630-minimal.log
+            printf '\nRMX3630_MINIMAL: END_LOG\n'
+        } >/dev/pmsg0 2>/dev/null || true
+    fi
+}
+
+pmsg_line() {
+    if [ -c /dev/pmsg0 ]; then
+        printf '\nRMX3630_MOD: %s\n' "$*" >/dev/pmsg0 2>/dev/null || true
+    fi
+}
+
+dump_usb_state() {
+    {
+        echo "=== RMX3630 USB/DEFERRED STATE ==="
+        echo "--- /sys/kernel/debug/devices_deferred"
+        cat /sys/kernel/debug/devices_deferred 2>&1 || true
+        echo "--- /sys/class/udc"
+        ls -la /sys/class/udc 2>&1 || true
+        echo "--- usb0 driver"
+        readlink -f /sys/bus/platform/devices/11200000.usb0/driver 2>&1 || true
+        echo "--- usb0 suppliers"
+        for supplier in /sys/bus/platform/devices/11200000.usb0/supplier:*; do
+            [ -e "$supplier" ] || continue
+            devlink="$(readlink -f "$supplier" 2>/dev/null)"
+            supplier_dev="$(readlink -f "$devlink/supplier" 2>/dev/null)"
+            printf '%s -> %s; device=%s; driver=' \
+                "${supplier##*/}" "$devlink" "$supplier_dev"
+            readlink -f "$supplier_dev/driver" 2>&1 || true
+        done
+        echo "=== END USB/DEFERRED STATE ==="
+    } >>/run/rmx3630-minimal.log 2>&1
+}
+
+# A module init can sleep forever in uninterruptible context. Keep an
+# independent PID 1 child that preserves the trace and reboots the one-shot
+# slot without requiring a hard power reset (which can corrupt ramoops).
+(
+    sleep 90
+    pmsg_line "FAILSAFE_REBOOT"
+    save_pmsg_log FAILSAFE_REBOOT
+    sync
+    reboot -f
+    sleep 60
+) &
+failsafe_pid=$!
+
+load_one() {
+    module="$1"
+    path="/lib/modules/$module"
+    if [ ! -f "$path" ]; then
+        echo "missing module: $module"
+        return
+    fi
+
+    echo "loading $module"
+    pmsg_line "LOAD $module"
+    insmod "$path" &
+    pid=$!
+    elapsed=0
+    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 5 ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "module timed out: $module"
+        pmsg_line "TIMEOUT $module"
+        kill -9 "$pid" 2>/dev/null || true
+    else
+        if wait "$pid" 2>/dev/null; then
+            pmsg_line "DONE $module"
+        else
+            echo "module returned an error: $module"
+            pmsg_line "ERROR $module"
+        fi
+    fi
+}
+
+udc=''
+usb_phase=0
+find_udc() {
+    # GKI also registers dummy_udc.0 for gadget self-tests. Binding the shell
+    # there succeeds but can never enumerate on the phone's physical port.
+    if [ -e /sys/class/udc/musb-hdrc ]; then
+        udc=musb-hdrc
+        return 0
+    fi
+    for candidate in /sys/class/udc/*; do
+        if [ -e "$candidate" ] && [ "${candidate##*/}" != dummy_udc.0 ]; then
+            udc=${candidate##*/}
+            return 0
+        fi
+    done
+    return 1
+}
+
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+
+# A custom kernel can expose its built-in MUSB UDC before PID 1. Only fall
+# back to the stock recovery module chain when no controller exists yet.
+if ! find_udc; then
+    while IFS= read -r module; do
+        case "$module" in
+            ''|'#'*) continue ;;
+        esac
+        load_one "$module"
+        mdev -s 2>/dev/null || true
+        if [ "$module" = musb_main.ko ]; then
+            usb_phase=1
+        fi
+        if [ "$usb_phase" -eq 1 ]; then
+            find_udc && break
+        fi
+    done </lib/modules/modules.load.probe
+fi
+
+mdev -s 2>/dev/null || true
+
+for retry in 1 2 3 4 5; do
+    find_udc && break
+    sleep 1
+done
+
+if [ -z "$udc" ]; then
+    echo "rmx3630-minimal: no UDC; rebooting to consume failed-slot retry" >/dev/kmsg 2>/dev/null || true
+    dump_usb_state
+    save_pmsg_log NO_UDC
+    sleep 10
+    reboot -f
+    sleep 60
+fi
+
+echo "UDC found: $udc"
+gadget=/sys/kernel/config/usb_gadget/rmx3630
+mkdir -p "$gadget/strings/0x409" "$gadget/configs/c.1/strings/0x409"
+echo 0x18d1 >"$gadget/idVendor"
+echo 0x4ee7 >"$gadget/idProduct"
+echo 0x0200 >"$gadget/bcdUSB"
+echo RMX3630LINUX >"$gadget/strings/0x409/serialnumber"
+echo Codex >"$gadget/strings/0x409/manufacturer"
+echo 'RMX3630 static Linux shell' >"$gadget/strings/0x409/product"
+echo 'CDC ACM shell' >"$gadget/configs/c.1/strings/0x409/configuration"
+echo 250 >"$gadget/configs/c.1/MaxPower"
+mkdir -p "$gadget/functions/acm.GS0"
+ln -s "$gadget/functions/acm.GS0" "$gadget/configs/c.1/acm.GS0"
+# MediaTek cable mode 1 is peripheral/device; mode 2 forces host mode.
+echo 1 >"/sys/class/udc/$udc/device/cmode" 2>/dev/null || true
+echo "$udc" >"$gadget/UDC"
+
+count=0
+while [ ! -c /dev/ttyGS0 ] && [ "$count" -lt 20 ]; do
+    mdev -s 2>/dev/null || true
+    sleep 1
+    count=$((count + 1))
+done
+
+if [ ! -c /dev/ttyGS0 ]; then
+    echo "rmx3630-minimal: UDC bound but ttyGS0 missing; rebooting" >/dev/kmsg 2>/dev/null || true
+    save_pmsg_log NO_TTYGS0
+    sleep 10
+    reboot -f
+    sleep 60
+fi
+
+echo "rmx3630-minimal: CDC ACM shell ready on ttyGS0" >/dev/kmsg 2>/dev/null || true
+kill "$failsafe_pid" 2>/dev/null || true
+save_pmsg_log CDC_ACM_READY
+(
+    cat /run/rmx3630-minimal.log >/dev/ttyGS0
+    stty -F /dev/ttyGS0 115200 raw -echo 2>/dev/null || true
+    exec setsid /bin/busybox sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1
+) &
+
+while true; do
+    sleep 3600
+done

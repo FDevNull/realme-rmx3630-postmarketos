@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Perform the MediaTek WMT userspace detect sequence used by stock Android."""
+
+import fcntl
+import os
+
+
+DEVICE = "/dev/wmtdetect"
+COMBO_IOCTL_SET_CHIP_ID = 0x40047701
+COMBO_IOCTL_GET_SOC_CHIP_ID = 0x80047703
+COMBO_IOCTL_DO_MODULE_INIT = 0x80047704
+COMBO_IOCTL_MODULE_CLEANUP = 0x80047705
+COMBO_IOCTL_CONNSYS_SOC_HW_INIT = 0x8004770A
+
+
+def call(fd: int, name: str, request: int, argument: int = 0) -> int:
+    result = fcntl.ioctl(fd, request, argument)
+    print(f"{name}: 0x{result:x}" if result >= 0 else f"{name}: {result}", flush=True)
+    return result
+
+
+def main() -> None:
+    fd = os.open(DEVICE, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        call(fd, "CONNSYS_SOC_HW_INIT", COMBO_IOCTL_CONNSYS_SOC_HW_INIT)
+        soc = call(fd, "GET_SOC_CHIP_ID", COMBO_IOCTL_GET_SOC_CHIP_ID)
+        if soc <= 0:
+            raise RuntimeError(f"invalid SoC chip ID: {soc}")
+        call(fd, "SET_CHIP_ID", COMBO_IOCTL_SET_CHIP_ID, soc)
+        call(fd, "MODULE_CLEANUP", COMBO_IOCTL_MODULE_CLEANUP, soc)
+        call(fd, "DO_MODULE_INIT", COMBO_IOCTL_DO_MODULE_INIT, soc)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

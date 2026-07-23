@@ -1,0 +1,153 @@
+#!/usr/bin/python3
+"""Soft-blank the RMX3630 AMOLED without disabling its DRM connector."""
+
+import glob
+import fcntl
+import os
+import signal
+import struct
+import sys
+import time
+
+
+EV_KEY = 0x01
+KEY_POWER = 116
+KEY_PRESS = 1
+EVENT = struct.Struct("@llHHi")
+BACKLIGHT = "/sys/class/leds/lcd-backlight/brightness"
+DRM_ENABLED = "/sys/class/drm/card0-DSI-1/enabled"
+DEFAULT_RESTORE_BRIGHTNESS = 1024
+EVIOCGRAB = 0x40044590
+POWER_DEBOUNCE_SECONDS = 0.75
+
+
+def log(message: str) -> None:
+    print(f"rmx3630-softpower: {message}", flush=True)
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="ascii") as handle:
+        return handle.read().strip()
+
+
+def write_text(path: str, value: int) -> None:
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write(f"{value}\n")
+
+
+def find_input_event(device_name: str) -> str | None:
+    for sys_event in sorted(glob.glob("/sys/class/input/event*")):
+        name_path = os.path.join(sys_event, "device", "name")
+        try:
+            if read_text(name_path) == device_name:
+                return os.path.join("/dev/input", os.path.basename(sys_event))
+        except OSError:
+            continue
+    return None
+
+
+def grab_touch() -> int | None:
+    touch_path = find_input_event("touchpanel")
+    if touch_path is None:
+        log("touchpanel event not found; continuing without touch grab")
+        return None
+
+    touch_fd = os.open(touch_path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(touch_fd, EVIOCGRAB, 1)
+    except OSError:
+        os.close(touch_fd)
+        raise
+    log(f"touch input grabbed on {touch_path}")
+    return touch_fd
+
+
+def release_touch(touch_fd: int | None) -> None:
+    if touch_fd is None:
+        return
+    try:
+        fcntl.ioctl(touch_fd, EVIOCGRAB, 0)
+    finally:
+        os.close(touch_fd)
+    log("touch input released")
+
+
+def choose_restore_brightness() -> int:
+    try:
+        configured = int(read_text("/etc/rmx3630-softpower-brightness"))
+        return max(1, min(2047, configured))
+    except (OSError, ValueError):
+        return DEFAULT_RESTORE_BRIGHTNESS
+
+
+def run() -> None:
+    soft_off = False
+    touch_fd = None
+    last_toggle = 0.0
+    restore_brightness = choose_restore_brightness()
+
+    while True:
+        event_path = find_input_event("mtk-pmic-keys")
+        if event_path is None:
+            time.sleep(1)
+            continue
+
+        log(f"listening on {event_path}, restore={restore_brightness}")
+        try:
+            with open(event_path, "rb", buffering=0) as event_file:
+                while True:
+                    data = event_file.read(EVENT.size)
+                    if len(data) != EVENT.size:
+                        raise OSError("short evdev read")
+
+                    _sec, _usec, event_type, code, value = EVENT.unpack(data)
+                    if event_type != EV_KEY or code != KEY_POWER or value != KEY_PRESS:
+                        continue
+
+                    now = time.monotonic()
+                    if now - last_toggle < POWER_DEBOUNCE_SECONDS:
+                        log("ignored duplicate power-key press")
+                        continue
+                    last_toggle = now
+
+                    if not soft_off:
+                        try:
+                            if read_text(DRM_ENABLED) != "enabled":
+                                log("refusing soft blank: DRM connector is disabled")
+                                continue
+                            touch_fd = grab_touch()
+                            write_text(BACKLIGHT, 0)
+                            soft_off = True
+                            log("display soft-blanked")
+                        except OSError as error:
+                            release_touch(touch_fd)
+                            touch_fd = None
+                            log(f"soft blank failed: {error}")
+                    else:
+                        try:
+                            write_text(BACKLIGHT, restore_brightness)
+                            release_touch(touch_fd)
+                            touch_fd = None
+                            soft_off = False
+                            log(f"display restored at {restore_brightness}")
+                        except OSError as error:
+                            log(f"restore failed: {error}")
+        except OSError as error:
+            release_touch(touch_fd)
+            touch_fd = None
+            soft_off = False
+            log(f"input disconnected: {error}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(0))
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            write_text(BACKLIGHT, choose_restore_brightness())
+        except OSError:
+            pass

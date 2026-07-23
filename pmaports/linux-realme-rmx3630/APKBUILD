@@ -1,0 +1,28 @@
+maintainer=""
+pkgname=linux-realme-rmx3630
+pkgver=5.10.209
+pkgrel=0
+pkgdesc="Stock downstream kernel for the Realme 10 4G"
+arch="aarch64"
+url="https://www.realme.com"
+license="GPL-2.0-only"
+options="!strip !check !tracedeps"
+
+_flavor="${pkgname#linux-}"
+_kernver="5.10.209-android12-9-o-05206-g23c1467af8f7"
+source="
+	stock-kernel.gz
+	kernel.release
+"
+
+package() {
+	install -Dm644 "$srcdir/stock-kernel.gz" \
+		"$pkgdir/boot/vmlinuz-$_flavor"
+	install -Dm644 "$srcdir/kernel.release" \
+		"$pkgdir/usr/share/kernel/$_flavor/kernel.release"
+}
+
+sha512sums="
+0630f7cecaddeba9cf13662876fdc4ba54b89b038cd10b60205f10533ef9f8757d05a53e25115389245b2b90ace87e018d8dbdd0e14fec75ab3ebaec23ca721b  stock-kernel.gz
+4b17f50f68ef8247f403ae427ca0ad0e9037df7d94e06bd93b9dd38baf000233514112a7d67c01d1955bea71d82f1fee37e989f73509a35fa896cdac2d71fb7a  kernel.release
+"
